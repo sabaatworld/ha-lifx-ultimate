@@ -20,4 +20,4 @@ This repository is generated automatically from
 [`sabaatworld/ha-core`](https://github.com/sabaatworld/ha-core) whenever its
 LIFX source changes. HACS tracks normal commits; no manual release selection is
 required.
-Generated from source revision `04f92849d9e88638bb7ef03d8efabf03bd0310a6` as version `0.0.1`.
+Generated from source revision `04f92849d9e88638bb7ef03d8efabf03bd0310a6` as version `0.0.2`.
