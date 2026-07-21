@@ -1,0 +1,70 @@
+{
+  "codeowners": [
+    "@Djelibeybi"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "network"
+  ],
+  "dhcp": [
+    {
+      "macaddress": "D073D5*"
+    },
+    {
+      "registered_devices": true
+    }
+  ],
+  "documentation": "https://github.com/sabaatworld/ha-lifx-ultimate",
+  "domain": "lifx",
+  "homekit": {
+    "models": [
+      "LIFX A19",
+      "LIFX A21",
+      "LIFX Beam",
+      "LIFX BR30",
+      "LIFX Candle",
+      "LIFX Ceiling",
+      "LIFX Clean",
+      "LIFX Color",
+      "LIFX Colour",
+      "LIFX DLCOL",
+      "LIFX Dlight",
+      "LIFX DLWW",
+      "LIFX Downlight",
+      "LIFX Filament",
+      "LIFX GU10",
+      "LIFX Indoor Neon",
+      "LIFX Lightstrip",
+      "LIFX Luna",
+      "LIFX Mini",
+      "LIFX Neon",
+      "LIFX Nightvision",
+      "LIFX PAR38",
+      "LIFX Permanent Outdoor",
+      "LIFX Pls",
+      "LIFX Plus",
+      "LIFX Round",
+      "LIFX Square",
+      "LIFX String",
+      "LIFX Tile",
+      "LIFX Tube",
+      "LIFX White",
+      "LIFX Z"
+    ]
+  },
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/sabaatworld/ha-lifx-ultimate/issues",
+  "loggers": [
+    "aiolifx",
+    "aiolifx_effects",
+    "bitstring"
+  ],
+  "name": "LIFX Ultimate",
+  "requirements": [
+    "aiolifx==1.2.2",
+    "aiolifx-effects==0.3.2",
+    "aiolifx-themes==1.0.4"
+  ],
+  "version": "0.0.1"
+}
