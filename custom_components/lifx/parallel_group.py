@@ -78,6 +78,7 @@ from .parallel import (
     ParallelCommand,
     ParallelDispatchOutcome,
     ParallelDispatchResult,
+    ParallelTransport,
 )
 from .util import convert_16_to_8, find_hsbk, lifx_features, merge_hsbk
 
@@ -127,6 +128,18 @@ def _ensure_members_ready(
         raise ConfigEntryNotReady("A selected LIFX light is not loaded")
 
 
+def _member_transport(coordinator: LIFXUpdateCoordinator) -> ParallelTransport:
+    """Build the worker transport from one loaded physical coordinator."""
+    target = bytes.fromhex(coordinator.device.mac_addr.replace(":", ""))
+    if len(target) != 6:
+        raise HomeAssistantError("A selected LIFX light has an invalid target")
+    return ParallelTransport(
+        coordinator.device.ip_addr,
+        coordinator.device.port,
+        target.ljust(8, b"\0"),
+    )
+
+
 def _raw_hsbk(
     color: tuple[float | int, float | int, float | int, int],
 ) -> tuple[int, int, int, int]:
@@ -173,7 +186,7 @@ class LIFXParallelGroupRuntime:
         self.members = list(members)
         self.group_id = entry.data[CONF_GROUP_ID]
         self.parallel = LIFXParallelRuntime(
-            hass, (member.device.ip_addr for member in members)
+            hass, (_member_transport(member) for member in members)
         )
         self.transition_on_duration = 0.0
         self.transition_off_duration = 0.0
@@ -488,7 +501,7 @@ class LIFXParallelGroupRuntime:
                         self._keepalive_failures[index],
                     )
                 reconnect = await self.parallel.async_request_reconnect(
-                    index, member.device.ip_addr
+                    index, _member_transport(member)
                 )
                 if (
                     generation != self._keepalive_generation
@@ -528,7 +541,9 @@ class LIFXParallelGroupRuntime:
             self._member_ready[index] = False
             self._member_reconnect_generation[index] = generation
             self.hass.async_create_background_task(
-                self._async_request_reconnect(index, host, generation),
+                self._async_request_reconnect(
+                    index, _member_transport(member), generation
+                ),
                 f"lifx-parallel-reconnect-{self.group_id}-{index}",
             )
         elif not reconnect:
@@ -536,13 +551,13 @@ class LIFXParallelGroupRuntime:
         self.async_update_listeners()
 
     async def _async_request_reconnect(
-        self, index: int, host: str, generation: int
+        self, index: int, transport: ParallelTransport, generation: int
     ) -> None:
         """Make a best-effort transport reconnect without changing availability."""
         if generation != self._member_binding_generation[index]:
             return
         try:
-            result = await self.parallel.async_request_reconnect(index, host)
+            result = await self.parallel.async_request_reconnect(index, transport)
         except HomeAssistantError:
             result = ParallelDispatchResult(ParallelDispatchOutcome.FAILED, 0)
         if result.outcome is not ParallelDispatchOutcome.COMPLETED:
