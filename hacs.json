@@ -1,3 +1,5 @@
 {
+  "hide_default_branch": true,
+  "homeassistant": "2026.7.2",
   "name": "LIFX Ultimate"
 }
