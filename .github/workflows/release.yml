@@ -13,6 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Create GitHub Release
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --repo sabaatworld/ha-lifx-ultimate
         env:
           GH_TOKEN: ${{ github.token }}
