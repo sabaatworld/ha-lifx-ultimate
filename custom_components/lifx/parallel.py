@@ -916,16 +916,20 @@ class LIFXParallelRuntime:
 
     async def async_dispatch(
         self,
-        commands: tuple[ParallelCommand, ...],
+        commands: tuple[ParallelCommand | None, ...],
     ) -> ParallelDispatchResult:
         """Dispatch the latest request, preempting any older staged request."""
         return await self.hass.async_add_executor_job(self._queue_dispatch, commands)
 
-    async def async_keepalive(self) -> ParallelDispatchResult:
+    async def async_keepalive(
+        self, member_indexes: frozenset[int]
+    ) -> ParallelDispatchResult:
         """Synchronize one cancellable Echo health check across every worker."""
         commands = tuple(
             ParallelCommand("echo", (secrets.token_bytes(ECHO_PAYLOAD_SIZE),))
-            for _worker in self._workers
+            if index in member_indexes
+            else None
+            for index, _worker in enumerate(self._workers)
         )
         return await self.hass.async_add_executor_job(
             self._queue_dispatch, commands, True
@@ -960,7 +964,7 @@ class LIFXParallelRuntime:
                         worker.pipe.send(("CANCEL", request_id, stage))
 
     def _queue_dispatch(
-        self, commands: tuple[ParallelCommand, ...], health: bool = False
+        self, commands: tuple[ParallelCommand | None, ...], health: bool = False
     ) -> ParallelDispatchResult:
         """Immediately supersede an active wait and replace unsent work."""
         if len(commands) != len(self._workers):
@@ -1069,7 +1073,7 @@ class LIFXParallelRuntime:
     def _dispatch(
         self,
         request_id: int,
-        commands: tuple[ParallelCommand, ...],
+        commands: tuple[ParallelCommand | None, ...],
         *,
         health: bool = False,
     ) -> set[int]:
@@ -1077,14 +1081,21 @@ class LIFXParallelRuntime:
             raise HomeAssistantError("The LIFX Device Group transport is unavailable")
         with self._lock:
             self._replace_dead_workers()
-            stages = tuple(command.stages for command in commands)
+            stages = tuple(command.stages if command is not None else () for command in commands)
+            if not any(stages):
+                raise HomeAssistantError("The LIFX Device Group has no available members")
             stage_count = max(len(member_stages) for member_stages in stages)
             failed_member_indexes: set[int] = set()
+            has_combined_command = any(len(member_stages) > 1 for member_stages in stages)
             for stage in range(stage_count):
                 targets = tuple(
                     (worker, member_stages[stage])
-                    for worker, member_stages in zip(self._workers, stages, strict=True)
-                    if stage < len(member_stages) and member_stages[stage] is not None
+                    for index, (worker, member_stages) in enumerate(
+                        zip(self._workers, stages, strict=True)
+                    )
+                    if index not in failed_member_indexes
+                    and stage < len(member_stages)
+                    and member_stages[stage] is not None
                 )
                 if not targets:
                     continue
@@ -1097,8 +1108,11 @@ class LIFXParallelRuntime:
                             tuple(worker for worker, _command in targets),
                         )
                     unresolved = targets
-                    stage_deadline = time.monotonic() + (3.0 if health else 15.0)
-                    for attempt in range(1 if health else 5):
+                    partial_first_stage = not health and has_combined_command and stage == 0
+                    stage_deadline = time.monotonic() + (
+                        3.0 if health else 5.0 if partial_first_stage else 15.0
+                    )
+                    for attempt in range(1 if health or partial_first_stage else 5):
                         unresolved = self._dispatch_stage(
                             request_id,
                             stage,
@@ -1106,10 +1120,16 @@ class LIFXParallelRuntime:
                             unresolved,
                             ack_required,
                             stage_deadline,
+                            5.0 if partial_first_stage else 3.0,
                         )
                         if not unresolved or health:
                             break
-                        if attempt == 4:
+                        if partial_first_stage:
+                            failed_member_indexes.update(
+                                self._workers.index(worker)
+                                for worker, _command in unresolved
+                            )
+                        elif attempt == 4:
                             raise _ParallelAckTimeout(
                                 "Timed out waiting for LIFX Device Group acknowledgements"
                             )
@@ -1135,6 +1155,7 @@ class LIFXParallelRuntime:
         targets: tuple[tuple[_Worker, ParallelCommand], ...],
         ack_required: bool,
         stage_deadline: float | None,
+        ack_timeout: float,
     ) -> tuple[tuple[_Worker, ParallelCommand], ...]:
         """Dispatch one stage and return members that require an ACK retry."""
         if self._current_generation.value != request_id:
@@ -1176,7 +1197,7 @@ class LIFXParallelRuntime:
             raise _ParallelPreparationError(str(err)) from err
         if self._current_generation.value != request_id:
             raise _ParallelPreempted("LIFX Device Group command superseded")
-        attempt_deadline = time.monotonic() + 3.0
+        attempt_deadline = time.monotonic() + ack_timeout
         try:
             self._dispatch_at_deadline(
                 request_id,
@@ -1196,6 +1217,7 @@ class LIFXParallelRuntime:
                 pending,
                 attempt_deadline,
                 success_event="ECHOED",
+                ack_timeout=ack_timeout,
             )
         if not ack_required:
             self._collect_selected(
@@ -1206,7 +1228,7 @@ class LIFXParallelRuntime:
             )
             return ()
         return self._collect_stage_acks(
-            request_id, stage, attempt, pending, attempt_deadline
+            request_id, stage, attempt, pending, attempt_deadline, ack_timeout=ack_timeout
         )
 
     def _collect_stage_acks(
@@ -1218,11 +1240,12 @@ class LIFXParallelRuntime:
         stage_deadline: float,
         *,
         success_event: str = "ACKED",
+        ack_timeout: float = 3.0,
     ) -> tuple[tuple[_Worker, ParallelCommand], ...]:
         """Collect one ACK outcome per worker without treating a timeout as fatal."""
         pending = pending.copy()
         unresolved: list[tuple[_Worker, ParallelCommand]] = []
-        deadline = min(time.monotonic() + 3.05, stage_deadline)
+        deadline = min(time.monotonic() + ack_timeout + 0.05, stage_deadline)
         while pending:
             if self._current_generation.value != request_id:
                 raise _ParallelPreempted("LIFX Device Group command superseded")

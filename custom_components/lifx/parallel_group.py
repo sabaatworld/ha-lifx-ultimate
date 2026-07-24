@@ -6,6 +6,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
 from statistics import fmean
+import time
 from typing import Any, Literal, override
 
 from aiolifx_themes.themes import Theme, ThemeLibrary
@@ -35,6 +36,7 @@ from .const import (
     DATA_LIFX_MANAGER,
     DEVICE_GROUP_KEEPALIVE_INTERVAL,
     DEVICE_GROUP_KEEPALIVE_MAX_CONSECUTIVE_FAILURES,
+    DEVICE_GROUP_MEMBER_RECONNECT_INTERVAL,
     DEVICE_GROUP_OPTIMISTIC_STATE_EXPIRY,
     DOMAIN,
     LIFX_CEILING_PRODUCT_IDS,
@@ -111,8 +113,8 @@ def _effects(coordinator: LIFXUpdateCoordinator) -> set[str]:
 def _members_are_ready(
     entries: list[ConfigEntry], coordinators: list[LIFXUpdateCoordinator]
 ) -> bool:
-    """Return whether every member is still loaded with its original runtime."""
-    return all(
+    """Return whether at least one member is loaded with its original runtime."""
+    return any(
         entry.state is ConfigEntryState.LOADED
         and getattr(entry, "runtime_data", None) is coordinator
         and coordinator.last_update_success
@@ -203,6 +205,11 @@ class LIFXParallelGroupRuntime:
         self._member_hosts = [coordinator.device.ip_addr for coordinator in members]
         self._member_binding_generation = [0] * len(members)
         self._member_reconnect_generation: list[int | None] = [None] * len(members)
+        self._member_retry_tasks: list[asyncio.Task[None] | None] = [None] * len(members)
+        self._member_retry_transports: list[ParallelTransport | None] = [None] * len(
+            members
+        )
+        self._member_next_reconnect = [0.0] * len(members)
         self._member_listener_removers: list[CALLBACK_TYPE | None] = [
             None
         ] * len(members)
@@ -217,9 +224,16 @@ class LIFXParallelGroupRuntime:
 
     @property
     def available(self) -> bool:
-        """Return whether every physical member is available."""
-        return all(self._member_ready) and all(self._keepalive_healthy) and _members_are_ready(
-            list(self.member_entries), self.members
+        """Return whether at least one physical member is available."""
+        return any(
+            entry.state is ConfigEntryState.LOADED
+            and getattr(entry, "runtime_data", None) is member
+            and member.last_update_success
+            and self._member_ready[index]
+            and self._keepalive_healthy[index]
+            for index, (entry, member) in enumerate(
+                zip(self.member_entries, self.members, strict=True)
+            )
         )
 
     @property
@@ -282,6 +296,9 @@ class LIFXParallelGroupRuntime:
         self._stopped = True
         self._cancel_optimistic_expiry()
         self._async_cancel_keepalive()
+        for task in self._member_retry_tasks:
+            if task is not None:
+                task.cancel()
         self._optimistic_state = None
         await self._async_stop_software_effect()
         self._async_remove_member_listeners()
@@ -459,10 +476,22 @@ class LIFXParallelGroupRuntime:
                 generation != self._keepalive_generation
                 or self._stopped
                 or self._software_effect is not None
-                or not _members_are_ready(list(self.member_entries), self.members)
+                or not self.available
             ):
                 return
-            result = await self.parallel.async_keepalive()
+            result = await self.parallel.async_keepalive(
+                frozenset(
+                    index
+                    for index, (entry, member) in enumerate(
+                        zip(self.member_entries, self.members, strict=True)
+                    )
+                    if entry.state is ConfigEntryState.LOADED
+                    and getattr(entry, "runtime_data", None) is member
+                    and member.last_update_success
+                    and self._member_ready[index]
+                    and self._keepalive_healthy[index]
+                )
+            )
             if generation != self._keepalive_generation:
                 return
             if result.outcome is not ParallelDispatchOutcome.COMPLETED:
@@ -500,17 +529,9 @@ class LIFXParallelGroupRuntime:
                         index,
                         self._keepalive_failures[index],
                     )
-                reconnect = await self.parallel.async_request_reconnect(
-                    index, _member_transport(member)
+                self._async_schedule_member_reconnect(
+                    index, _member_transport(member), self._member_binding_generation[index]
                 )
-                if (
-                    generation != self._keepalive_generation
-                    or (
-                        reconnect is not None
-                        and reconnect.outcome is ParallelDispatchOutcome.SUPERSEDED
-                    )
-                ):
-                    return
             if changed:
                 self.async_update_listeners()
         except asyncio.CancelledError:
@@ -540,11 +561,8 @@ class LIFXParallelGroupRuntime:
         if reconnect and self._member_reconnect_generation[index] != generation:
             self._member_ready[index] = False
             self._member_reconnect_generation[index] = generation
-            self.hass.async_create_background_task(
-                self._async_request_reconnect(
-                    index, _member_transport(member), generation
-                ),
-                f"lifx-parallel-reconnect-{self.group_id}-{index}",
+            self._async_schedule_member_reconnect(
+                index, _member_transport(member), generation
             )
         elif not reconnect:
             self._member_ready[index] = ready
@@ -572,6 +590,50 @@ class LIFXParallelGroupRuntime:
         self._keepalive_failures[index] = 0
         self._keepalive_healthy[index] = True
         self.async_update_listeners()
+
+    @callback
+    def _async_schedule_member_reconnect(
+        self, index: int, transport: ParallelTransport, generation: int
+    ) -> None:
+        """Coalesce member recovery while retaining the latest coordinator transport."""
+        self._member_retry_transports[index] = transport
+        if self._member_retry_tasks[index] is not None:
+            return
+        self._member_retry_tasks[index] = self.hass.async_create_background_task(
+            self._async_run_member_reconnect(index, generation),
+            f"lifx-parallel-reconnect-{self.group_id}-{index}",
+        )
+
+    async def _async_run_member_reconnect(self, index: int, generation: int) -> None:
+        """Reconnect one slot no more than once per configured interval."""
+        try:
+            delay = self._member_next_reconnect[index] - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if generation != self._member_binding_generation[index] or self._stopped:
+                return
+            member = self.members[index]
+            if self.member_entries[index].state is not ConfigEntryState.LOADED:
+                return
+            if not member.last_update_success:
+                return
+            self._member_next_reconnect[index] = (
+                time.monotonic() + DEVICE_GROUP_MEMBER_RECONNECT_INTERVAL
+            )
+            await self._async_request_reconnect(
+                index, _member_transport(member), generation
+            )
+        finally:
+            self._member_retry_tasks[index] = None
+        if (
+            generation == self._member_binding_generation[index]
+            and not self._stopped
+            and not self._member_ready[index]
+            and self._member_retry_transports[index] is not None
+        ):
+            self._async_schedule_member_reconnect(
+                index, self._member_retry_transports[index], generation
+            )
 
     @callback
     def async_add_availability_listener(
@@ -674,6 +736,7 @@ class LIFXParallelGroupRuntime:
         self, operation: str, commands: tuple[ParallelCommand, ...]
     ) -> ParallelDispatchResult:
         """Return one safe result for unprojected Group work."""
+        commands = self._commands_for_available_members(commands)
         try:
             result = await self.parallel.async_dispatch(commands)
         except HomeAssistantError:
@@ -683,6 +746,23 @@ class LIFXParallelGroupRuntime:
         else:
             self._log_dispatch_outcome(operation, result)
         return result
+
+    def _commands_for_available_members(
+        self, commands: tuple[ParallelCommand, ...]
+    ) -> tuple[ParallelCommand | None, ...]:
+        """Exclude unavailable members from one immutable dispatch snapshot."""
+        return tuple(
+            command
+            if entry.state is ConfigEntryState.LOADED
+            and getattr(entry, "runtime_data", None) is member
+            and member.last_update_success
+            and self._member_ready[index]
+            and self._keepalive_healthy[index]
+            else None
+            for index, (entry, member, command) in enumerate(
+                zip(self.member_entries, self.members, commands, strict=True)
+            )
+        )
 
     def _reset_keepalive_health(self) -> None:
         """Treat a completed normal Group request as endpoint reachability proof."""
@@ -773,7 +853,9 @@ class LIFXParallelGroupRuntime:
         """Dispatch a command and keep its aggregate projection until polling catches up."""
         generation = self._begin_projection(states)
         try:
-            result = await self.parallel.async_dispatch(commands)
+            result = await self.parallel.async_dispatch(
+                self._commands_for_available_members(commands)
+            )
         except HomeAssistantError:
             result = ParallelDispatchResult(ParallelDispatchOutcome.FAILED, 0)
         if result.outcome is not ParallelDispatchOutcome.COMPLETED:
