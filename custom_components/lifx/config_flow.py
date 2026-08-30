@@ -17,7 +17,6 @@ from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 from homeassistant.helpers.typing import DiscoveryInfoType
 
 from .const import (
-    _LOGGER,
     CONF_ENTRY_TYPE,
     CONF_GROUP_ID,
     CONF_MEMBERS,
@@ -25,6 +24,7 @@ from .const import (
     DEFAULT_ATTEMPTS,
     DOMAIN,
     ENTRY_TYPE_PARALLEL_GROUP,
+    LOGGER,
     OVERALL_TIMEOUT,
     TARGET_ANY,
 )
@@ -123,12 +123,12 @@ class LifXConfigFlow(ConfigFlow, domain=DOMAIN):
         if not (legacy_entry := async_get_legacy_entry(self.hass)):
             return False
         device_registry = dr.async_get(self.hass)
-        existing_device = device_registry.async_get_device(
+        existing_devices = device_registry.async_get_devices(
             identifiers={(DOMAIN, self.unique_id)}
         )
-        return bool(
-            existing_device is not None
-            and legacy_entry.entry_id in existing_device.config_entries
+        return any(
+            device.config_entry_id == legacy_entry.entry_id
+            for device in existing_devices
         )
 
     async def async_step_discovery_confirm(
@@ -137,7 +137,7 @@ class LifXConfigFlow(ConfigFlow, domain=DOMAIN):
         """Confirm discovery."""
         assert self._discovered_device is not None
         discovered = self._discovered_device
-        _LOGGER.debug(
+        LOGGER.debug(
             "Confirming discovery of %s (%s) [%s]",
             discovered.label,
             discovered.group,

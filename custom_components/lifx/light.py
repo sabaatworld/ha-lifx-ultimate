@@ -27,7 +27,6 @@ from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 from homeassistant.helpers.typing import VolDictType
 
 from .const import (
-    _LOGGER,
     ATTR_DURATION,
     ATTR_INFRARED,
     ATTR_POWER,
@@ -37,6 +36,7 @@ from .const import (
     INFRARED_BRIGHTNESS,
     LIFX_CEILING_PRODUCT_IDS,
     LIFX_STATE_SETTLE_DELAY,
+    LOGGER,
 )
 from .coordinator import FirmwareEffect, LIFXConfigEntry, LIFXUpdateCoordinator
 from .entity import LIFXEntity
@@ -249,7 +249,7 @@ class LIFXLight(LIFXEntity, LightEntity, RestoreEntity):
             infrared_entity_id = self.coordinator.async_get_entity_id(
                 Platform.SELECT, INFRARED_BRIGHTNESS
             )
-            _LOGGER.warning(
+            LOGGER.warning(
                 (
                     "The 'infrared' attribute of 'lifx.set_state' is deprecated:"
                     " call 'select.select_option' targeting '%s' instead"

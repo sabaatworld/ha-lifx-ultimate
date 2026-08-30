@@ -35,13 +35,13 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
-    _LOGGER,
     ATTR_REMAINING,
     DEFAULT_ATTEMPTS,
     DOMAIN,
     IDENTIFY_WAVEFORM,
     LIFX_128ZONE_CEILING_PRODUCT_IDS,
     LIFX_STATE_SETTLE_DELAY,
+    LOGGER,
     MAX_ATTEMPTS_PER_UPDATE_REQUEST_MESSAGE,
     MAX_UPDATE_TIME,
     MESSAGE_RETRIES,
@@ -117,14 +117,14 @@ class LIFXUpdateCoordinator(DataUpdateCoordinator[None]):
 
         super().__init__(
             hass,
-            _LOGGER,
+            LOGGER,
             config_entry=config_entry,
             name=f"{config_entry.title} ({self.device.ip_addr})",
             update_interval=timedelta(seconds=PHYSICAL_LIGHT_POLL_INTERVAL),
             # We don't want an immediate refresh since the device
             # takes a moment to reflect the state change
             request_refresh_debouncer=Debouncer(
-                hass, _LOGGER, cooldown=REQUEST_REFRESH_DELAY, immediate=False
+                hass, LOGGER, cooldown=REQUEST_REFRESH_DELAY, immediate=False
             ),
         )
 
@@ -208,7 +208,7 @@ class LIFXUpdateCoordinator(DataUpdateCoordinator[None]):
         """Clear a virtual-off marker when polling observes external visibility."""
         if not self.actual_power_on:
             if self.virtual_off:
-                _LOGGER.debug("LIFX virtual off cleared after physical power-off poll")
+                LOGGER.debug("LIFX virtual off cleared after physical power-off poll")
             self.virtual_off = False
             return
         visible = bool(self.device.color[2])
@@ -217,7 +217,7 @@ class LIFXUpdateCoordinator(DataUpdateCoordinator[None]):
         if visible:
             color = tuple(self.device.color)
             if self.virtual_off:
-                _LOGGER.debug("LIFX virtual off cleared after external visible-state poll")
+                LOGGER.debug("LIFX virtual off cleared after external visible-state poll")
             self.async_record_virtual_on(color)
 
     @property

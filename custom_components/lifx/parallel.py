@@ -19,7 +19,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import _LOGGER
+from .const import LOGGER
 
 DEFAULT_PORT = 56700
 HEADER = struct.Struct("<HHI8s6sBBQHH")
@@ -1031,7 +1031,7 @@ class LIFXParallelRuntime:
                     ParallelDispatchOutcome.FAILED, request.request_id
                 )
             except Exception:  # noqa: BLE001
-                _LOGGER.exception("LIFX Device Group worker dispatcher failed")
+                LOGGER.exception("LIFX Device Group worker dispatcher failed")
                 request.result = ParallelDispatchResult(
                     ParallelDispatchOutcome.FAILED, request.request_id
                 )
@@ -1162,7 +1162,7 @@ class LIFXParallelRuntime:
             raise _ParallelPreempted("LIFX Device Group command superseded")
         pending = {worker.pipe: (worker, command) for worker, command in targets}
         try:
-            _LOGGER.debug(
+            LOGGER.debug(
                 "LIFX Device Group request %s stage %s preparing: ack_required=%s "
                 "member_count=%s",
                 request_id,
@@ -1328,7 +1328,7 @@ class LIFXParallelRuntime:
             and isinstance(event[1], int)
             and event[1] < self._current_generation.value
         ):
-            _LOGGER.debug(
+            LOGGER.debug(
                 "LIFX Device Group discarded superseded worker event: event=%s request=%s stage=%s",
                 event[0] if event else None,
                 event[1],
@@ -1336,7 +1336,7 @@ class LIFXParallelRuntime:
             )
             return
         self._worker_events.setdefault(pipe, deque()).append(event)
-        _LOGGER.debug(
+        LOGGER.debug(
             "LIFX Device Group deferred stale worker event: event=%s request=%s stage=%s",
             event[0] if event else None,
             event[1] if len(event) > 1 else None,
@@ -1354,7 +1354,7 @@ class LIFXParallelRuntime:
         """Send each ready worker one request-scoped common deadline."""
         workers = tuple(workers)
         deadline = time.monotonic_ns() + 5_000_000
-        _LOGGER.debug(
+        LOGGER.debug(
             "LIFX Device Group request %s stage %s releasing %s workers at "
             "monotonic_ns=%s (lead_ms=%.3f)",
             request_id,
@@ -1383,7 +1383,7 @@ class LIFXParallelRuntime:
     ) -> None:
         """Cancel a stage and wait until every worker has returned to idle."""
         pending = {worker.pipe: worker for worker, _command in targets}
-        _LOGGER.debug(
+        LOGGER.debug(
             "LIFX Device Group request %s stage %s cancellation requested for %s workers",
             request_id,
             stage,
@@ -1507,7 +1507,7 @@ class LIFXParallelRuntime:
                     and self._current_generation.value != request_id
                 ):
                     raise _ParallelPreempted("LIFX Device Group command superseded")
-                _LOGGER.debug(
+                LOGGER.debug(
                     "LIFX Device Group worker event: event=%s request=%s stage=%s",
                     message[0],
                     message[1] if len(message) > 1 else None,

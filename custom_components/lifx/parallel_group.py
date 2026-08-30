@@ -30,7 +30,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_call_later
 
 from .const import (
-    _LOGGER,
+    LOGGER,
     CONF_GROUP_ID,
     CONF_MEMBERS,
     DATA_LIFX_MANAGER,
@@ -495,7 +495,7 @@ class LIFXParallelGroupRuntime:
             if generation != self._keepalive_generation:
                 return
             if result.outcome is not ParallelDispatchOutcome.COMPLETED:
-                _LOGGER.debug("LIFX Device Group keepalive cancelled or unavailable")
+                LOGGER.debug("LIFX Device Group keepalive cancelled or unavailable")
                 return
             failed = result.failed_member_indexes
             changed = False
@@ -504,7 +504,7 @@ class LIFXParallelGroupRuntime:
                     if self._keepalive_failures[index] or not self._keepalive_healthy[index]:
                         changed = True
                     if not self._keepalive_healthy[index]:
-                        _LOGGER.warning(
+                        LOGGER.warning(
                             "LIFX Device Group member %s recovered after keepalive",
                             index,
                         )
@@ -519,12 +519,12 @@ class LIFXParallelGroupRuntime:
                 ):
                     self._keepalive_healthy[index] = False
                     changed = True
-                    _LOGGER.warning(
+                    LOGGER.warning(
                         "LIFX Device Group member %s became unavailable after keepalive failures",
                         index,
                     )
                 else:
-                    _LOGGER.debug(
+                    LOGGER.debug(
                         "LIFX Device Group keepalive missed for member %s (failure %s)",
                         index,
                         self._keepalive_failures[index],
@@ -537,7 +537,7 @@ class LIFXParallelGroupRuntime:
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
-            _LOGGER.exception("LIFX Device Group keepalive failed")
+            LOGGER.exception("LIFX Device Group keepalive failed")
         finally:
             if generation == self._keepalive_generation and not self._stopped:
                 self._keepalive_task = None
@@ -716,10 +716,10 @@ class LIFXParallelGroupRuntime:
     def _can_accept_user_command(self, operation: str) -> bool:
         """Return whether an entity action may send packets without a service error."""
         if self._recovery_task is not None:
-            _LOGGER.debug("LIFX Device Group %s command skipped: recovering", operation)
+            LOGGER.debug("LIFX Device Group %s command skipped: recovering", operation)
             return False
         if not self.available:
-            _LOGGER.debug("LIFX Device Group %s command skipped: unavailable", operation)
+            LOGGER.debug("LIFX Device Group %s command skipped: unavailable", operation)
             return False
         return True
 
@@ -728,9 +728,9 @@ class LIFXParallelGroupRuntime:
     ) -> None:
         """Log one non-sensitive operational Group outcome."""
         if result.outcome is ParallelDispatchOutcome.SUPERSEDED:
-            _LOGGER.debug("LIFX Device Group %s command superseded", operation)
+            LOGGER.debug("LIFX Device Group %s command superseded", operation)
         elif result.outcome is not ParallelDispatchOutcome.COMPLETED:
-            _LOGGER.debug("LIFX Device Group %s command did not complete", operation)
+            LOGGER.debug("LIFX Device Group %s command did not complete", operation)
 
     async def _async_dispatch_commands(
         self, operation: str, commands: tuple[ParallelCommand, ...]
@@ -773,13 +773,13 @@ class LIFXParallelGroupRuntime:
             self._keepalive_failures[index] = 0
             self._keepalive_healthy[index] = True
         if changed:
-            _LOGGER.warning("LIFX Device Group recovered after a successful command")
+            LOGGER.warning("LIFX Device Group recovered after a successful command")
             self.async_update_listeners()
 
     def _display_state_for_command(self, operation: str) -> _OptimisticGroupState:
         """Snapshot and log the displayed state used to build one operation."""
         display_state = self.display_state
-        _LOGGER.debug(
+        LOGGER.debug(
             "LIFX Device Group %s state baseline: is_on=%s",
             self.group_id,
             operation,
