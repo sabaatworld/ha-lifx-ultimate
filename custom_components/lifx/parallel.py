@@ -381,9 +381,7 @@ def _build_packet(
             ack_required=ack_required,
         )
     elif command.kind == "reboot":
-        packet = _set_reboot(
-            source, packet_sequence, target, ack_required=ack_required
-        )
+        packet = _set_reboot(source, packet_sequence, target, ack_required=ack_required)
     elif command.kind == "multizone_effect":
         packet = _set_multizone_effect(
             source,
@@ -440,10 +438,10 @@ def _wait_for_ack(
         except OSError:
             return False
         try:
-            response_source, response_sequence, response_target, packet_type = _parse_header(
-                data
+            response_source, response_sequence, response_target, packet_type = (
+                _parse_header(data)
             )
-        except (struct.error, ValueError):
+        except struct.error, ValueError:
             continue
         if (
             response_source == source
@@ -489,10 +487,10 @@ def _wait_for_echo(
         except OSError:
             return False
         try:
-            response_source, response_sequence, response_target, packet_type = _parse_header(
-                data
+            response_source, response_sequence, response_target, packet_type = (
+                _parse_header(data)
             )
-        except (struct.error, ValueError):
+        except struct.error, ValueError:
             continue
         if (
             response_source == source
@@ -671,7 +669,9 @@ def _dispatch_prepared(
         if stage_deadline is None:
             pipe.send(("CANCELLED", request_id, stage, attempt))
             return True
-        if (ack_required or command.kind == "echo") and time.monotonic() >= stage_deadline:
+        if (
+            ack_required or command.kind == "echo"
+        ) and time.monotonic() >= stage_deadline:
             pipe.send(("ACK_TIMEOUT", request_id, stage, attempt))
             return True
         _report_dispatch_result(
@@ -748,9 +748,15 @@ def _worker(
                     target = new_target
                     pipe.send(("RECONNECTED", reconnect_request_id))
                 continue
-            _kind, request_id, stage, attempt, staged_command, ack_required, stage_deadline = (
-                command
-            )
+            (
+                _kind,
+                request_id,
+                stage,
+                attempt,
+                staged_command,
+                ack_required,
+                stage_deadline,
+            ) = command
             assert udp is not None
             if not _dispatch_prepared(
                 udp,
@@ -905,9 +911,7 @@ class LIFXParallelRuntime:
         worker.pipe.close()
         replacement = self._spawn_worker(index, worker.transport)
         self._workers[index] = replacement
-        self._collect_selected(
-            {replacement.pipe: replacement}, "STARTED", 5.0, None
-        )
+        self._collect_selected({replacement.pipe: replacement}, "STARTED", 5.0, None)
 
     def _replace_dead_workers(self) -> None:
         """Restore only the slots whose process has genuinely exited."""
@@ -1055,7 +1059,9 @@ class LIFXParallelRuntime:
         request_id = self._current_generation.value
         with self._lock:
             if index >= len(self._workers):
-                return ParallelDispatchResult(ParallelDispatchOutcome.UNAVAILABLE, request_id)
+                return ParallelDispatchResult(
+                    ParallelDispatchOutcome.UNAVAILABLE, request_id
+                )
             self._replace_dead_worker(index)
             worker = self._workers[index]
             try:
@@ -1065,9 +1071,13 @@ class LIFXParallelRuntime:
                 )
                 worker.transport = transport
             except _ParallelPreempted:
-                return ParallelDispatchResult(ParallelDispatchOutcome.SUPERSEDED, request_id)
-            except (BrokenPipeError, EOFError, OSError, HomeAssistantError):
-                return ParallelDispatchResult(ParallelDispatchOutcome.FAILED, request_id)
+                return ParallelDispatchResult(
+                    ParallelDispatchOutcome.SUPERSEDED, request_id
+                )
+            except BrokenPipeError, EOFError, OSError, HomeAssistantError:
+                return ParallelDispatchResult(
+                    ParallelDispatchOutcome.FAILED, request_id
+                )
         return ParallelDispatchResult(ParallelDispatchOutcome.COMPLETED, request_id)
 
     def _dispatch(
@@ -1081,12 +1091,18 @@ class LIFXParallelRuntime:
             raise HomeAssistantError("The LIFX Device Group transport is unavailable")
         with self._lock:
             self._replace_dead_workers()
-            stages = tuple(command.stages if command is not None else () for command in commands)
+            stages = tuple(
+                command.stages if command is not None else () for command in commands
+            )
             if not any(stages):
-                raise HomeAssistantError("The LIFX Device Group has no available members")
+                raise HomeAssistantError(
+                    "The LIFX Device Group has no available members"
+                )
             stage_count = max(len(member_stages) for member_stages in stages)
             failed_member_indexes: set[int] = set()
-            has_combined_command = any(len(member_stages) > 1 for member_stages in stages)
+            has_combined_command = any(
+                len(member_stages) > 1 for member_stages in stages
+            )
             for stage in range(stage_count):
                 targets = tuple(
                     (worker, member_stages[stage])
@@ -1108,7 +1124,9 @@ class LIFXParallelRuntime:
                             tuple(worker for worker, _command in targets),
                         )
                     unresolved = targets
-                    partial_first_stage = not health and has_combined_command and stage == 0
+                    partial_first_stage = (
+                        not health and has_combined_command and stage == 0
+                    )
                     stage_deadline = time.monotonic() + (
                         3.0 if health else 5.0 if partial_first_stage else 15.0
                     )
@@ -1140,7 +1158,9 @@ class LIFXParallelRuntime:
                         )
                 finally:
                     with self._dispatch_condition:
-                        if self._active_stage is not None and self._active_stage[:2] == (
+                        if self._active_stage is not None and self._active_stage[
+                            :2
+                        ] == (
                             request_id,
                             stage,
                         ):
@@ -1228,7 +1248,12 @@ class LIFXParallelRuntime:
             )
             return ()
         return self._collect_stage_acks(
-            request_id, stage, attempt, pending, attempt_deadline, ack_timeout=ack_timeout
+            request_id,
+            stage,
+            attempt,
+            pending,
+            attempt_deadline,
+            ack_timeout=ack_timeout,
         )
 
     def _collect_stage_acks(
@@ -1256,11 +1281,7 @@ class LIFXParallelRuntime:
             messages = {
                 pipe: event
                 for pipe in pending
-                if (
-                    event := self._pop_worker_event(
-                        pipe, request_id, stage, attempt
-                    )
-                )
+                if (event := self._pop_worker_event(pipe, request_id, stage, attempt))
                 is not None
             }
             if messages:
@@ -1268,7 +1289,10 @@ class LIFXParallelRuntime:
             else:
                 ready = wait(tuple(pending), timeout=min(0.05, remaining))
             if not ready:
-                if any(not worker.process.is_alive() for worker, _command in pending.values()):
+                if any(
+                    not worker.process.is_alive()
+                    for worker, _command in pending.values()
+                ):
                     raise HomeAssistantError("A LIFX parallel worker exited")
                 continue
             for pipe in ready:
@@ -1402,7 +1426,9 @@ class LIFXParallelRuntime:
                 raise _ParallelPreempted("LIFX Device Group command superseded")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise HomeAssistantError("Timed out cancelling LIFX Device Group command")
+                raise HomeAssistantError(
+                    "Timed out cancelling LIFX Device Group command"
+                )
             ready = wait(tuple(pending), timeout=min(0.01, remaining))
             for pipe in ready:
                 worker = pending[pipe]
@@ -1495,9 +1521,7 @@ class LIFXParallelRuntime:
                 if stage is not None and (len(message) < 3 or message[2] != stage):
                     self._store_worker_event(pipe, message)
                     continue
-                if attempt is not None and (
-                    len(message) < 4 or message[3] != attempt
-                ):
+                if attempt is not None and (len(message) < 4 or message[3] != attempt):
                     self._store_worker_event(pipe, message)
                     continue
                 if (

@@ -3,13 +3,32 @@
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
-from homeassistant.const import CONF_HOST, CONF_IP_ADDRESS, CONF_MAC
+from homeassistant.const import CONF_HOST, CONF_IP_ADDRESS, CONF_LOCATION
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_ENTRY_TYPE, CONF_LABEL, CONF_MEMBERS, ENTRY_TYPE_PARALLEL_GROUP
+from .const import (
+    CONF_ENTRY_TYPE,
+    CONF_GROUP,
+    CONF_LABEL,
+    CONF_MAC_ADDRESS,
+    CONF_MEMBERS,
+    CONF_SERIAL,
+    CONF_TITLE,
+    ENTRY_TYPE_PARALLEL_GROUP,
+)
 from .coordinator import LIFXConfigEntry
 
-TO_REDACT = [CONF_LABEL, CONF_HOST, CONF_IP_ADDRESS, CONF_MAC, CONF_MEMBERS]
+TO_REDACT = [
+    CONF_LABEL,
+    CONF_HOST,
+    CONF_IP_ADDRESS,
+    CONF_SERIAL,
+    CONF_TITLE,
+    CONF_MAC_ADDRESS,
+    CONF_GROUP,
+    CONF_LOCATION,
+    CONF_MEMBERS,
+]
 
 
 async def async_get_config_entry_diagnostics(
@@ -32,9 +51,8 @@ async def async_get_config_entry_diagnostics(
 
     coordinator = entry.runtime_data
     return {
-        "entry": {
-            "title": entry.title,
-            "data": async_redact_data(dict(entry.data), TO_REDACT),
-        },
-        "data": async_redact_data(await coordinator.diagnostics(), TO_REDACT),
+        "entry": async_redact_data(
+            {CONF_TITLE: entry.title, "data": entry.data}, TO_REDACT
+        ),
+        "data": async_redact_data(coordinator.data.as_dict, TO_REDACT),
     }

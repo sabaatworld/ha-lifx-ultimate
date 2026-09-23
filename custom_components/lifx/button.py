@@ -16,6 +16,8 @@ from .coordinator import LIFXConfigEntry, LIFXUpdateCoordinator
 from .entity import LIFXEntity
 from .parallel_group import async_add_parallel_group_entities
 
+PARALLEL_UPDATES = 1
+
 RESTART_BUTTON_DESCRIPTION = ButtonEntityDescription(
     key=RESTART,
     device_class=ButtonDeviceClass.RESTART,
@@ -41,38 +43,24 @@ async def async_setup_entry(
 
     coordinator = entry.runtime_data
     async_add_entities(
-        [LIFXRestartButton(coordinator), LIFXIdentifyButton(coordinator)]
+        [
+            LIFXRestartButton(coordinator, RESTART_BUTTON_DESCRIPTION),
+            LIFXIdentifyButton(coordinator, IDENTIFY_BUTTON_DESCRIPTION),
+        ]
     )
 
 
-class LIFXButton(LIFXEntity, ButtonEntity):
-    """Base LIFX button."""
-
-    _attr_should_poll = False
-
-    def __init__(self, coordinator: LIFXUpdateCoordinator) -> None:
-        """Initialise a LIFX button."""
-        super().__init__(coordinator)
-        self._attr_unique_id = (
-            f"{coordinator.serial_number}_{self.entity_description.key}"
-        )
-
-
-class LIFXRestartButton(LIFXButton):
+class LIFXRestartButton(LIFXEntity, ButtonEntity):
     """LIFX restart button."""
-
-    entity_description = RESTART_BUTTON_DESCRIPTION
 
     @override
     async def async_press(self) -> None:
         """Restart the bulb on button press."""
-        self.bulb.set_reboot()
+        await self.coordinator.async_restart()
 
 
-class LIFXIdentifyButton(LIFXButton):
+class LIFXIdentifyButton(LIFXEntity, ButtonEntity):
     """LIFX identify button."""
-
-    entity_description = IDENTIFY_BUTTON_DESCRIPTION
 
     @override
     async def async_press(self) -> None:

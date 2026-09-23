@@ -7,9 +7,17 @@ from dataclasses import dataclass
 from datetime import timedelta
 from statistics import fmean
 import time
-from typing import Any, Literal, override
+from typing import Any, Literal, cast, override
 
-from aiolifx_themes.themes import Theme, ThemeLibrary
+from lifx import (
+    HSBK,
+    CeilingLight,
+    LightState,
+    MatrixLight,
+    MultiZoneLight,
+    Theme,
+    ThemeLibrary,
+)
 
 from homeassistant.components.button import ButtonDeviceClass, ButtonEntity
 from homeassistant.components.light import (
@@ -30,7 +38,6 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_call_later
 
 from .const import (
-    LOGGER,
     CONF_GROUP_ID,
     CONF_MEMBERS,
     DATA_LIFX_MANAGER,
@@ -39,7 +46,7 @@ from .const import (
     DEVICE_GROUP_MEMBER_RECONNECT_INTERVAL,
     DEVICE_GROUP_OPTIMISTIC_STATE_EXPIRY,
     DOMAIN,
-    LIFX_CEILING_PRODUCT_IDS,
+    LOGGER,
     TRANSITION_CROSS_DURATION,
     TRANSITION_OFF_DURATION,
     TRANSITION_ON_DURATION,
@@ -82,30 +89,31 @@ from .parallel import (
     ParallelDispatchResult,
     ParallelTransport,
 )
-from .util import convert_16_to_8, find_hsbk, lifx_features, merge_hsbk
+from .util import find_hsbk
 
 GROUP_PLATFORMS = [Platform.BUTTON, Platform.LIGHT, Platform.NUMBER]
 
 
 def _color_modes(coordinator: LIFXUpdateCoordinator) -> set[ColorMode]:
-    features = lifx_features(coordinator.device)
-    if features["color"]:
+    capabilities = coordinator.data.capabilities
+    if capabilities.has_color:
         return {ColorMode.COLOR_TEMP, ColorMode.HS}
-    if features["min_kelvin"] != features["max_kelvin"]:
+    if capabilities.kelvin_min != capabilities.kelvin_max:
         return {ColorMode.COLOR_TEMP}
     return {ColorMode.BRIGHTNESS}
 
 
 def _effects(coordinator: LIFXUpdateCoordinator) -> set[str]:
-    features = lifx_features(coordinator.device)
+    device = coordinator.device
+    capabilities = coordinator.data.capabilities
     effects = {"effect_pulse", "effect_stop"}
-    if features["color"]:
+    if capabilities.has_color:
         effects.add("effect_colorloop")
-    if features["multizone"]:
+    if isinstance(device, MultiZoneLight):
         effects.add("effect_move")
-    if features["matrix"]:
+    if isinstance(device, MatrixLight):
         effects.update({"effect_flame", "effect_morph"})
-    if coordinator.device.product in LIFX_CEILING_PRODUCT_IDS:
+    if isinstance(device, CeilingLight):
         effects.add("effect_sky")
     return effects
 
@@ -132,11 +140,11 @@ def _ensure_members_ready(
 
 def _member_transport(coordinator: LIFXUpdateCoordinator) -> ParallelTransport:
     """Build the worker transport from one loaded physical coordinator."""
-    target = bytes.fromhex(coordinator.device.mac_addr.replace(":", ""))
+    target = bytes.fromhex(coordinator.device.serial.replace(":", ""))
     if len(target) != 6:
         raise HomeAssistantError("A selected LIFX light has an invalid target")
     return ParallelTransport(
-        coordinator.device.ip_addr,
+        coordinator.device.ip,
         coordinator.device.port,
         target.ljust(8, b"\0"),
     )
@@ -152,6 +160,27 @@ def _raw_hsbk(
         round(saturation / 100 * 65535) if saturation <= 100 else round(saturation),
         round(brightness / 100 * 65535) if brightness <= 100 else round(brightness),
         round(kelvin),
+    )
+
+
+def _hsbk_to_raw16(color: HSBK) -> tuple[int, int, int, int]:
+    """Convert a library HSBK color into raw 16-bit packet values."""
+    return (
+        round(color.hue / 360 * 65535),
+        round(color.saturation * 65535),
+        round(color.brightness * 65535),
+        color.kelvin,
+    )
+
+
+def _raw16_to_hsbk(color: tuple[int, int, int, int]) -> HSBK:
+    """Convert raw 16-bit packet values into a library HSBK color."""
+    hue, saturation, brightness, kelvin = color
+    return HSBK(
+        hue=min(hue / 65535 * 360, 360.0),
+        saturation=min(saturation / 65535, 1.0),
+        brightness=min(brightness / 65535, 1.0),
+        kelvin=kelvin,
     )
 
 
@@ -201,21 +230,25 @@ class LIFXParallelGroupRuntime:
         self._optimistic_state: _OptimisticGroupState | None = None
         self._optimistic_expiry_task: asyncio.Task[None] | None = None
         self._recovery_task: asyncio.Task[None] | None = None
-        self._member_ready = [coordinator.last_update_success for coordinator in members]
-        self._member_hosts = [coordinator.device.ip_addr for coordinator in members]
+        self._member_ready = [
+            coordinator.last_update_success for coordinator in members
+        ]
+        self._member_hosts = [coordinator.device.ip for coordinator in members]
         self._member_binding_generation = [0] * len(members)
         self._member_reconnect_generation: list[int | None] = [None] * len(members)
-        self._member_retry_tasks: list[asyncio.Task[None] | None] = [None] * len(members)
+        self._member_retry_tasks: list[asyncio.Task[None] | None] = [None] * len(
+            members
+        )
         self._member_retry_transports: list[ParallelTransport | None] = [None] * len(
             members
         )
         self._member_next_reconnect = [0.0] * len(members)
-        self._member_listener_removers: list[CALLBACK_TYPE | None] = [
-            None
-        ] * len(members)
-        self._member_entry_state_removers: list[CALLBACK_TYPE | None] = [
-            None
-        ] * len(members)
+        self._member_listener_removers: list[CALLBACK_TYPE | None] = [None] * len(
+            members
+        )
+        self._member_entry_state_removers: list[CALLBACK_TYPE | None] = [None] * len(
+            members
+        )
         self._keepalive_failures = [0] * len(members)
         self._keepalive_healthy = [True] * len(members)
         self._keepalive_generation = 0
@@ -246,12 +279,12 @@ class LIFXParallelGroupRuntime:
         """Return physical state with each member's virtual power projection."""
         return tuple(
             _MemberCommandState(
-                tuple(
+                _hsbk_to_raw16(
                     member.resume_hsbk
                     if member.virtual_off and member.resume_hsbk is not None
-                    else member.device.color
+                    else cast(LightState, member.data).color
                 ),
-                65535 if member.device.power_level and not member.virtual_off else 0,
+                65535 if member.data.power != 0 and not member.virtual_off else 0,
             )
             for member in self.members
         )
@@ -501,7 +534,10 @@ class LIFXParallelGroupRuntime:
             changed = False
             for index, member in enumerate(self.members):
                 if index not in failed:
-                    if self._keepalive_failures[index] or not self._keepalive_healthy[index]:
+                    if (
+                        self._keepalive_failures[index]
+                        or not self._keepalive_healthy[index]
+                    ):
                         changed = True
                     if not self._keepalive_healthy[index]:
                         LOGGER.warning(
@@ -530,7 +566,9 @@ class LIFXParallelGroupRuntime:
                         self._keepalive_failures[index],
                     )
                 self._async_schedule_member_reconnect(
-                    index, _member_transport(member), self._member_binding_generation[index]
+                    index,
+                    _member_transport(member),
+                    self._member_binding_generation[index],
                 )
             if changed:
                 self.async_update_listeners()
@@ -552,7 +590,7 @@ class LIFXParallelGroupRuntime:
             self.async_update_listeners()
             return
         ready = member.last_update_success
-        host = member.device.ip_addr
+        host = member.device.ip
         reconnect = ready and (
             not self._member_ready[index] or host != self._member_hosts[index]
         )
@@ -780,7 +818,7 @@ class LIFXParallelGroupRuntime:
         """Snapshot and log the displayed state used to build one operation."""
         display_state = self.display_state
         LOGGER.debug(
-            "LIFX Device Group %s state baseline: is_on=%s",
+            "LIFX Device Group %s %s state baseline: is_on=%s",
             self.group_id,
             operation,
             display_state.is_on,
@@ -790,8 +828,8 @@ class LIFXParallelGroupRuntime:
     async def _async_set_state(self, **kwargs: Any) -> None:
         """Dispatch a state change without delaying a newer request."""
         power = kwargs.get("power")
-        hsbk = find_hsbk(self.hass, **kwargs)
         display_state = self._display_state_for_command("state command")
+        hsbk = find_hsbk(_raw16_to_hsbk(display_state.color), **kwargs)
         transition_kind: Literal["on", "off", "cross"] = (
             "off"
             if power is False
@@ -804,7 +842,7 @@ class LIFXParallelGroupRuntime:
         states: list[_MemberCommandState] = []
 
         for member in self.members:
-            color = tuple(merge_hsbk(display_state.color, hsbk)) if hsbk else None
+            color = _hsbk_to_raw16(hsbk) if hsbk else None
             duration = self._transition_ms(member, transition_kind, kwargs)
             target_color = color or display_state.color
             target_power = (
@@ -819,9 +857,11 @@ class LIFXParallelGroupRuntime:
                     )
                 )
             elif power is True and not display_state.is_on:
-                if member.device.power_level:
+                if member.data.power != 0:
                     commands.append(
-                        ParallelCommand("color", (*target_color, duration), pad_before=1)
+                        ParallelCommand(
+                            "color", (*target_color, duration), pad_before=1
+                        )
                     )
                 else:
                     commands.append(
@@ -865,9 +905,9 @@ class LIFXParallelGroupRuntime:
         self._reset_keepalive_health()
         for member, state in zip(self.members, states, strict=True):
             if virtual_off:
-                member.async_record_virtual_off(state.color)
+                member.async_record_virtual_off(_raw16_to_hsbk(state.color))
             elif state.power_level:
-                member.async_record_virtual_on(state.color)
+                member.async_record_virtual_on(_raw16_to_hsbk(state.color))
             member.async_set_updated_data(None)
         return True
 
@@ -906,12 +946,11 @@ class LIFXParallelGroupRuntime:
         if not self._can_accept_user_command("restart"):
             return
         await self._async_dispatch_commands(
-            "restart",
-            tuple(ParallelCommand("reboot", ()) for _member in self.members)
+            "restart", tuple(ParallelCommand("reboot", ()) for _member in self.members)
         )
 
     async def async_start_effect(self, service: str, **kwargs: Any) -> None:
-        """Apply an effect without falling back to member aiolifx connections."""
+        """Apply an effect without falling back to member device connections."""
         self.async_note_user_mutation()
         if not self._can_accept_user_command("effect"):
             return
@@ -959,7 +998,7 @@ class LIFXParallelGroupRuntime:
                         for _member in self.members
                     ),
                     kwargs,
-                )
+                ),
             )
             return
         effect, speed, sky_type, saturation_min, saturation_max = {
@@ -1000,7 +1039,7 @@ class LIFXParallelGroupRuntime:
                     for _member in self.members
                 ),
                 kwargs,
-            )
+            ),
         )
 
     async def _async_stop_software_effect(self) -> None:
@@ -1017,10 +1056,9 @@ class LIFXParallelGroupRuntime:
         display_state = self._display_state_for_command("stop effect")
         commands = []
         for member in self.members:
-            features = lifx_features(member.device)
-            if features["matrix"]:
+            if isinstance(member.device, MatrixLight):
                 commands.append(ParallelCommand("tile_effect", (0, 0, 0, 0, 0, ())))
-            elif features["multizone"]:
+            elif isinstance(member.device, MultiZoneLight):
                 commands.append(ParallelCommand("multizone_effect", (0, 0, 0)))
             else:
                 commands.append(ParallelCommand("color", (*display_state.color, 0)))
@@ -1030,9 +1068,9 @@ class LIFXParallelGroupRuntime:
         """Resolve a service palette to direct-LAN HSBK values."""
         palette = kwargs.get(ATTR_PALETTE)
         if palette is None:
-            theme: Theme = ThemeLibrary().get_theme(kwargs.get(ATTR_THEME, "exciting"))
-            palette = theme.colors
-        return tuple(_raw_hsbk(color) for color in palette)
+            theme: Theme = ThemeLibrary.get(kwargs.get(ATTR_THEME, "exciting"))
+            return tuple(_hsbk_to_raw16(color) for color in theme.colors)
+        return tuple(_raw_hsbk(tuple(color)) for color in palette)
 
     async def _async_paint_theme(self, **kwargs: Any) -> None:
         """Paint one theme color per member at one common deadline."""
@@ -1044,7 +1082,9 @@ class LIFXParallelGroupRuntime:
         states = tuple(
             _MemberCommandState(
                 color,
-                65535 if kwargs.get(ATTR_POWER_ON, True) else 65535
+                65535
+                if kwargs.get(ATTR_POWER_ON, True)
+                else 65535
                 if display_state.is_on
                 else 0,
             )
@@ -1061,7 +1101,7 @@ class LIFXParallelGroupRuntime:
 
     async def _async_pulse(self, **kwargs: Any) -> None:
         """Run pulse ticks through the same warmed worker dispatcher."""
-        hsbk = find_hsbk(self.hass, **kwargs)
+        hsbk = find_hsbk(_raw16_to_hsbk(self.display_state.color), **kwargs)
         period = kwargs.get(ATTR_PERIOD, 1.0)
         cycles = kwargs.get(ATTR_CYCLES, 1)
         for _cycle in range(round(cycles)):
@@ -1089,10 +1129,7 @@ class LIFXParallelGroupRuntime:
         while True:
             commands = []
             for member in self.members:
-                hue = (
-                    display_state.color[0] / 65535 * 360
-                    + tick * change
-                ) % 360
+                hue = (display_state.color[0] / 65535 * 360 + tick * change) % 360
                 saturation = saturation_min if tick % 2 else saturation_max
                 level = (
                     display_state.color[2] if brightness is None else brightness * 257
@@ -1174,7 +1211,7 @@ class LIFXParallelGroupLight(LIFXParallelGroupEntity, LightEntity):
     @override
     def brightness(self) -> int | None:
         state = self.runtime.display_state
-        return convert_16_to_8(state.color[2]) if state.is_on else None
+        return state.color[2] >> 8 if state.is_on else None
 
     @property
     @override
@@ -1209,8 +1246,12 @@ class LIFXParallelGroupLight(LIFXParallelGroupEntity, LightEntity):
         if ColorMode.COLOR_TEMP not in self._attr_supported_color_modes:
             return None
         return max(
-            lifx_features(member.device)["min_kelvin"]
-            for member in self.runtime.members
+            (
+                kelvin
+                for member in self.runtime.members
+                if (kelvin := member.data.capabilities.kelvin_min) is not None
+            ),
+            default=None,
         )
 
     @property
@@ -1219,8 +1260,12 @@ class LIFXParallelGroupLight(LIFXParallelGroupEntity, LightEntity):
         if ColorMode.COLOR_TEMP not in self._attr_supported_color_modes:
             return None
         return min(
-            lifx_features(member.device)["max_kelvin"]
-            for member in self.runtime.members
+            (
+                kelvin
+                for member in self.runtime.members
+                if (kelvin := member.data.capabilities.kelvin_max) is not None
+            ),
+            default=None,
         )
 
     @override

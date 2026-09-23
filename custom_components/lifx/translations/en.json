@@ -2,26 +2,30 @@
     "config": {
         "abort": {
             "already_configured": "Device is already configured",
-            "already_in_progress": "Configuration flow is already in progress",
+            "already_in_progress": "This is already being configured. Finish the existing configuration before starting again.",
             "cannot_connect": "Failed to connect",
-            "invalid_members": "The selected lights are not available physical LIFX devices.",
-            "no_devices_found": "No devices found on the network"
+            "no_devices_found": "No devices found on the network",
+            "reconfigure_successful": "Reconfiguration was successful",
+            "wrong_device": "The device at this address is not the one this entry was set up for."
         },
         "error": {
             "cannot_connect": "Failed to connect",
             "duplicate_members": "Select each light only once.",
-            "invalid_members": "The selected lights are not available physical LIFX devices."
+            "invalid_members": "The selected lights are not available physical LIFX devices.",
+            "invalid_serial": "This is not a valid LIFX serial number."
         },
         "flow_title": "{label} ({group})",
         "step": {
             "device": {
                 "data": {
-                    "host": "Host"
+                    "host": "Host",
+                    "serial": "Serial number"
                 },
                 "data_description": {
-                    "host": "The hostname or IP address of your LIFX device."
+                    "host": "The hostname or IP address of your LIFX device.",
+                    "serial": "The twelve-character serial number printed on your LIFX device. On its own, it is resolved by broadcasting to your network."
                 },
-                "description": "If you leave the host empty, discovery will be used to find devices."
+                "description": "Fill in the host, the serial number, or both. If you leave both empty, discovery will be used to find devices."
             },
             "discovery_confirm": {
                 "description": "Do you want to set up {label} ({group})?"
@@ -36,7 +40,19 @@
             "pick_device": {
                 "data": {
                     "device": "Device"
+                },
+                "data_description": {
+                    "device": "The discovered LIFX device to add."
                 }
+            },
+            "reconfigure": {
+                "data": {
+                    "host": "Host"
+                },
+                "data_description": {
+                    "host": "The new hostname or IP address of this LIFX device."
+                },
+                "description": "Update where Home Assistant reaches this LIFX device. The serial number is not changed, so this has to be the same device."
             },
             "user": {
                 "menu_options": {
@@ -75,6 +91,44 @@
             "rssi": {
                 "name": "RSSI"
             }
+        }
+    },
+    "exceptions": {
+        "cannot_connect": {
+            "message": "Unable to connect to the LIFX device at {host}"
+        },
+        "cannot_read_state": {
+            "message": "The current state of the LIFX device could not be read, so the requested change was not written to it"
+        },
+        "device_error": {
+            "message": "Error communicating with the LIFX device: {error}"
+        },
+        "invalid_color": {
+            "message": "The requested color is not valid: {error}"
+        },
+        "invalid_serial": {
+            "message": "The LIFX device identified by {unique_id} cannot be migrated because that is not a LIFX serial number. Delete the entry and add the device again."
+        },
+        "no_hev": {
+            "message": "{entity_id} does not have HEV LEDs"
+        },
+        "no_infrared": {
+            "message": "{entity_id} does not have infrared LEDs"
+        },
+        "no_lifx_target": {
+            "message": "The targets of action lifx.{service} include no LIFX light"
+        },
+        "no_matrix_target": {
+            "message": "The targets of action lifx.{service} include no LIFX matrix light"
+        },
+        "no_multizone_target": {
+            "message": "The targets of action lifx.{service} include no LIFX multizone light"
+        },
+        "not_loaded": {
+            "message": "LIFX is not loaded, so this action cannot be performed."
+        },
+        "update_failed": {
+            "message": "Error fetching the state of the LIFX device: {error}"
         }
     },
     "services": {

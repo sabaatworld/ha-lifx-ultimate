@@ -15,7 +15,7 @@ integration.
 
 ## 📦 Automated publishing
 
-This package is generated from [`sabaatworld/ha-core`](https://github.com/sabaatworld/ha-core) at source revision `52e02730198d856a292c12eb170cca36181df3e7` and published as `2026.10.0-v0.0.10`. HACS uses the GitHub Release for each published version to offer updates.
+This package is generated from [`sabaatworld/ha-core`](https://github.com/sabaatworld/ha-core) at source revision `fea954e2a4f3107419934f4a18b7760db5e123bc` and published as `2026.10.0-v0.0.11`. HACS uses the GitHub Release for each published version to offer updates.
 ## ✨ Why LIFX Ultimate?
 
 I love LIFX lights. They are comparatively affordable, and I find their
