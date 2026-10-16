@@ -8,6 +8,8 @@ from enum import Enum, auto
 import gc
 import multiprocessing as mp
 from multiprocessing.connection import Connection, wait
+from pathlib import Path
+import runpy
 import secrets
 import signal
 import socket
@@ -887,17 +889,39 @@ class LIFXParallelRuntime:
         assert self._source is not None
         assert self._stop_event is not None
         parent, child = self._context.Pipe(duplex=True)
-        process = self._context.Process(
-            target=_worker,
-            args=(
-                transport,
+        name = f"lifx-parallel-{index}-{transport.host}"
+        if __name__.startswith("custom_components."):
+            # Spawn must bootstrap imports before unpickling custom-module types.
+            worker_args = (
+                str(Path(__file__).parent.parent.parent),
+                __name__,
+                (transport.host, transport.port, transport.target),
                 self._source,
                 child,
                 self._current_generation,
                 self._stop_event,
-            ),
-            name=f"lifx-parallel-{index}-{transport.host}",
-        )
+            )
+            process = self._context.Process(
+                target=runpy.run_path,
+                args=(
+                    str(Path(__file__).with_name("_parallel_worker.py")),
+                    {"lifx_worker_args": worker_args},
+                    "__main__",
+                ),
+                name=name,
+            )
+        else:
+            process = self._context.Process(
+                target=_worker,
+                args=(
+                    transport,
+                    self._source,
+                    child,
+                    self._current_generation,
+                    self._stop_event,
+                ),
+                name=name,
+            )
         process.start()
         child.close()
         return _Worker(transport, process, parent)

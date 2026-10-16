@@ -62,7 +62,7 @@
   "requirements": [
     "lifx-async==6.5.1"
   ],
-  "version": "2026.10.0-v0.0.12",
+  "version": "2026.10.0-v0.0.13",
   "zeroconf": [
     "_lifx._udp.local."
   ]

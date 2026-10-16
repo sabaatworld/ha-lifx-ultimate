@@ -29,8 +29,8 @@ from homeassistant.components.light import (
 )
 from homeassistant.components.number import NumberEntityDescription, RestoreNumber
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
-from homeassistant.const import EntityCategory, Platform
-from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, EntityCategory, Platform
+from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
@@ -908,7 +908,8 @@ class LIFXParallelGroupRuntime:
                 member.async_record_virtual_off(_raw16_to_hsbk(state.color))
             elif state.power_level:
                 member.async_record_virtual_on(_raw16_to_hsbk(state.color))
-            member.async_set_updated_data(None)
+            # Virtual power changes must not replace the typed physical state.
+            member.async_update_listeners()
         return True
 
     def _with_power_stage(
@@ -1386,6 +1387,16 @@ async def async_setup_parallel_group_entry(
         runtime.async_start_member_listeners()
         entry.runtime_data = runtime
         await hass.config_entries.async_forward_entry_setups(entry, GROUP_PLATFORMS)
+
+        async def _async_shutdown_on_stop(_event: Event) -> None:
+            # Python otherwise waits indefinitely for the persistent child processes.
+            await runtime.async_stop()
+
+        entry.async_on_unload(
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, _async_shutdown_on_stop
+            )
+        )
     except HomeAssistantError as err:
         await runtime.async_stop()
         raise ConfigEntryNotReady(str(err)) from err
