@@ -7,8 +7,13 @@ from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
 from homeassistant.const import CONF_HOST, CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import (
+    config_validation as cv,
+    entity_registry as er,
+    restore_state,
+)
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_ENTRY_TYPE,
@@ -64,13 +69,16 @@ PLATFORMS = [
     Platform.NUMBER,
     Platform.SELECT,
     Platform.SENSOR,
+    Platform.SWITCH,
 ]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the LIFX component."""
     async_setup_services(hass)
-    hass.data[DATA_LIFX_MANAGER] = LIFXManager(hass)
+    manager = LIFXManager(hass)
+    await manager.virtual_power.async_load()
+    hass.data[DATA_LIFX_MANAGER] = manager
     async_setup_discovery(hass)
     return True
 
@@ -134,7 +142,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: LIFXConfigEntry) -> bool
     entry.async_on_unload(device.close)
 
     coordinator = LIFXUpdateCoordinator(hass, entry, device)
+    entity_id = er.async_get(hass).async_get_entity_id(
+        Platform.LIGHT, DOMAIN, entry.data[CONF_SERIAL]
+    )
+    if (
+        entity_id
+        and (stored := restore_state.async_get(hass).last_states.get(entity_id))
+        and stored.extra_data is not None
+    ):
+        await hass.data[DATA_LIFX_MANAGER].virtual_power.async_import_legacy(
+            entry.data[CONF_SERIAL], stored.extra_data.as_dict()
+        )
     await coordinator.async_config_entry_first_refresh()
+    await hass.data[DATA_LIFX_MANAGER].virtual_power.async_reconcile(
+        entry.data[CONF_SERIAL], coordinator.data, now=dt_util.utcnow()
+    )
     async_repair_device_registry(hass, entry, coordinator.data)
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

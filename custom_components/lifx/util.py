@@ -20,7 +20,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.util import color as color_util
 
-from .const import CONF_SERIAL, DOMAIN, LOGGER
+from .const import CONF_SERIAL, DOMAIN, LIFX_MIN_COLOR_RAMP, LOGGER
 
 if TYPE_CHECKING:
     from .coordinator import LIFXConfigEntry
@@ -28,6 +28,15 @@ if TYPE_CHECKING:
 _SERIAL_PATTERN = re.compile(
     r"(?:[0-9a-f]{12}|(?:[0-9a-f]{2}:){5}[0-9a-f]{2})", re.IGNORECASE
 )
+
+
+def resolve_color_ramp_duration(
+    duration: float, *, explicit: bool, ordinary: bool
+) -> float:
+    """Apply the ordinary color floor after defaults and explicit precedence."""
+    if explicit or not ordinary:
+        return duration
+    return max(duration, LIFX_MIN_COLOR_RAMP)
 
 
 def normalize_serial(value: str) -> str:

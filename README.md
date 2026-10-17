@@ -15,7 +15,7 @@ integration.
 
 ## 📦 Automated publishing
 
-This package is generated from [`sabaatworld/ha-core`](https://github.com/sabaatworld/ha-core) at source revision `8563b8a729276129e350bae38166823d1dc283de` and published as `2026.10.0-v0.0.13`. HACS uses the GitHub Release for each published version to offer updates.
+This package is generated from [`sabaatworld/ha-core`](https://github.com/sabaatworld/ha-core) at source revision `53e153f74aaa699001bd97c961a6aa731dc2eed3` and published as `2026.10.0-v0.0.14`. HACS uses the GitHub Release for each published version to offer updates.
 ## ✨ Why LIFX Ultimate?
 
 I love LIFX lights. They are comparatively affordable, and I find their
@@ -57,6 +57,29 @@ vary with its firmware, Wi-Fi, and internal rendering.
 > marginally more energy than normal standby, and appear as on at zero
 > brightness in the LIFX app. Home Assistant presents the group and individual
 > lights as off.
+
+## 🔌 Virtual Power Off
+
+Every physical LIFX light and Device Group has a **Virtual Power Off**
+configuration switch, defaulting to **On**. It controls how the light responds
+to an off command:
+
+| Target | Virtual Power Off | Result |
+|--------|-------------------|--------|
+| Physical light | On | Virtual off — brightness fades to zero, power stays on |
+| Physical light | Off | Actual power-off — hardware power is cut |
+| Device Group | On | Virtual off for every member, regardless of their individual settings |
+| Device Group | Off | Actual power-off for every member, regardless of their individual settings |
+
+Changing the toggle affects future off commands only — it sends no light
+packets and does not alter an existing virtual-off state. A virtually-off
+light remains recognisable and restorable regardless of the toggle setting:
+turning it on restores its saved brightness and colour (including per-zone
+patterns on multizone and matrix lights), and turning it off again uses the
+current toggle setting.
+
+The toggle is independent per light and per Device Group, and is persisted
+across reloads and restarts.
 
 ## 🌈 Fade and transition defaults
 

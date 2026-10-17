@@ -26,6 +26,7 @@ CONF_TITLE = "title"
 CONF_ENTRY_TYPE = "entry_type"
 CONF_GROUP_ID = "group_id"
 CONF_MEMBERS = "members"
+CONF_VIRTUAL_POWER_OFF = "virtual_power_off"
 
 ENTRY_TYPE_PARALLEL_GROUP = "parallel_group"
 
@@ -70,6 +71,7 @@ SERVICE_SET_STATE = "set_state"
 
 HEV_CYCLE_STATE = "hev_cycle_state"
 LIFX_IDENTIFY_DELAY = 3.0
+LIFX_MIN_COLOR_RAMP = 0.25
 INFRARED_BRIGHTNESS = "infrared_brightness"
 INFRARED_LEVELS = {
     "Disabled": 0.0,

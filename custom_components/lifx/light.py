@@ -63,13 +63,21 @@ from .util import (
     overwrites_existing_color,
     parse_hsbk_changes,
     replace_hsbk,
+    resolve_color_ramp_duration,
+)
+from .virtual_power import (
+    VirtualPowerImage,
+    VirtualPowerRequest,
+    VirtualPowerToken,
+    capture_image,
+    darken_image,
+    merge_image,
+    resolve_recovery_image,
 )
 
 PARALLEL_UPDATES = 1
 
 LIFX_STATE_SETTLE_DELAY = 0.3
-
-LIFX_MIN_COLOR_RAMP = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +255,17 @@ class LIFXLight(LIFXEntity, LightEntity, RestoreEntity):
         return self.coordinator.transition_on_duration
 
     async def set_state(self, **kwargs: Any) -> None:
+        """Reserve command order before effect cleanup can suspend."""
+        store = self.manager.virtual_power
+        reserved = store.async_reserve(self.coordinator.virtual_power_serial)
+        try:
+            await self._async_set_state(reserved, **kwargs)
+        finally:
+            store.async_release(reserved)
+
+    async def _async_set_state(
+        self, reserved: VirtualPowerToken, **kwargs: Any
+    ) -> None:
         """Set a color on the light and turn it on/off."""
         self._cancel_postponed_update()
 
@@ -255,6 +274,8 @@ class LIFXLight(LIFXEntity, LightEntity, RestoreEntity):
             await self.manager.effects_conductor.stop([self.device])
         except LifxError as err:
             raise device_error(err) from err
+        if not self.manager.virtual_power.async_is_current(reserved):
+            return
 
         if ATTR_EFFECT in kwargs:
             await self.default_effect(**kwargs)
@@ -264,9 +285,7 @@ class LIFXLight(LIFXEntity, LightEntity, RestoreEntity):
 
         self._resolve_brightness_step(kwargs)
 
-        # These are both False if ATTR_POWER is not set
         power_on = kwargs.get(ATTR_POWER, False)
-        power_off = not kwargs.get(ATTR_POWER, True)
         physical_power_off = kwargs.get(ATTR_POWER) is False
 
         new_hsbk = find_hsbk(self.coordinator.data.color, **kwargs)
@@ -278,54 +297,258 @@ class LIFXLight(LIFXEntity, LightEntity, RestoreEntity):
                 power_on, physical_power_off, new_hsbk
             )
 
-        if (
-            power_on
-            and self.coordinator.virtual_off
-            and self.coordinator.resume_hsbk is not None
-        ):
-            new_hsbk = replace_hsbk(
-                self.coordinator.resume_hsbk, parse_hsbk_changes(**kwargs)
-            )
+        record = self.coordinator.virtual_power_record
+        virtual_derived = (
+            record.virtual_off or record.resume_required or record.pending is not None
+        )
 
-        fading_on = power_on and not self.is_on
-
+        wrote = True
         if physical_power_off:
-            self.coordinator.async_clear_virtual_off()
+            if self.coordinator.virtual_power_off_enabled:
+                await self._async_virtual_off(kwargs, duration, reserved)
+            else:
+                await self._async_actual_off(new_hsbk, kwargs, duration, reserved)
+        elif power_on and virtual_derived:
+            await self._async_recover_virtual_off(kwargs, duration, reserved)
+        elif virtual_derived and ATTR_POWER not in kwargs and not self.is_on:
+            await self._async_prepare_next_on(kwargs, reserved)
+            wrote = False
+        elif virtual_derived:
+            await self._async_recover_virtual_off(kwargs, duration, reserved)
+        else:
+            store = self.manager.virtual_power
+            try:
+                before = self.coordinator.command_image
+            except ValueError:
+                # Ordinary writes retain their existing incomplete-state behavior.
+                before = VirtualPowerImage(self.coordinator.data.color)
+            target = merge_image(
+                before,
+                parse_hsbk_changes(**kwargs),
+                zones=tuple(kwargs[ATTR_ZONES]) if ATTR_ZONES in kwargs else None,
+            )
+            tokens = await store.async_begin_many(
+                {
+                    reserved.serial: VirtualPowerRequest(
+                        kind="on",
+                        before_image=before,
+                        target_image=target,
+                        before_power_on=self.coordinator.actual_power_on,
+                        before_virtual_off=record.virtual_off,
+                        before_resume_required=record.resume_required,
+                        duration=duration,
+                    )
+                },
+                expected={reserved.serial: reserved},
+            )
+            if reserved.serial not in tokens:
+                return
+            fading_on = power_on and not self.is_on
+            try:
+                if new_hsbk:
+                    await self.set_color(
+                        new_hsbk,
+                        kwargs,
+                        duration=resolve_color_ramp_duration(
+                            0.0 if fading_on else duration,
+                            explicit=ATTR_TRANSITION in kwargs,
+                            ordinary=not fading_on,
+                        ),
+                        token=reserved,
+                    )
+                if power_on and store.async_is_current(reserved):
+                    await self.set_power(True, duration=duration if fading_on else 0.0)
+            except HomeAssistantError:
+                await store.async_finish(reserved, "uncertain")
+                raise
+            await store.async_finish(reserved, "completed")
+
+        if wrote:
+            # Avoid state ping-pong by holding off updates as the state settles
+            await asyncio.sleep(LIFX_STATE_SETTLE_DELAY)
+
+            # Update when the transition starts and ends
+            await self.update_during_transition(duration)
+
+    async def _async_virtual_off(
+        self, kwargs: dict[str, Any], duration: float, reserved: VirtualPowerToken
+    ) -> None:
+        """Persist the recovery candidate, then fade the light to zero brightness."""
+        store = self.manager.virtual_power
+        serial = self.coordinator.virtual_power_serial
+        record = self.coordinator.virtual_power_record
+        before = self.coordinator.command_image
+        changes = parse_hsbk_changes(**kwargs)
+        resume = resolve_recovery_image(
+            record,
+            self.coordinator.data,
+            changes,
+            zones=tuple(kwargs[ATTR_ZONES]) if ATTR_ZONES in kwargs else None,
+        )
+        tokens = await store.async_begin_many(
+            {
+                serial: VirtualPowerRequest(
+                    kind="virtual_off",
+                    before_image=before,
+                    target_image=darken_image(resume),
+                    before_power_on=self.coordinator.actual_power_on,
+                    before_virtual_off=record.virtual_off,
+                    before_resume_required=record.resume_required,
+                    duration=duration,
+                    recovery_image=resume
+                    if any(value is not None for value in changes.values())
+                    else None,
+                )
+            },
+            expected={serial: reserved},
+        )
+        if (token := tokens.get(serial)) is None:
+            return
+        try:
+            if self.coordinator.actual_power_on:
+                await self.async_write_recovery_image(
+                    darken_image(resume), duration=duration
+                )
+        except HomeAssistantError:
+            await store.async_finish(token, "uncertain")
+            raise
+        await store.async_finish(token, "completed")
+
+    async def _async_actual_off(
+        self,
+        new_hsbk: HSBK | None,
+        kwargs: dict[str, Any],
+        duration: float,
+        reserved: VirtualPowerToken,
+    ) -> None:
+        """Use the legacy hardware power-off path while retaining recovery data."""
+        store = self.manager.virtual_power
+        serial = self.coordinator.virtual_power_serial
+        record = self.coordinator.virtual_power_record
+        tokens = await store.async_begin_many(
+            {
+                serial: VirtualPowerRequest(
+                    kind="actual_off",
+                    before_image=self.coordinator.command_image,
+                    target_image=None,
+                    before_power_on=self.coordinator.actual_power_on,
+                    before_virtual_off=record.virtual_off,
+                    before_resume_required=record.resume_required,
+                    duration=duration,
+                )
+            },
+            expected={serial: reserved},
+        )
+        if (token := tokens.get(serial)) is None:
+            return
+        try:
             if not self.is_on:
                 await self.set_power(False, duration=0.0)
                 if new_hsbk:
-                    await self.set_color(new_hsbk, kwargs, duration=duration)
+                    await self.set_color(
+                        new_hsbk, kwargs, duration=duration, token=token
+                    )
             else:
                 if new_hsbk:
-                    await self.set_color(new_hsbk, kwargs, duration=duration)
-                await self.set_power(False, duration=duration)
-        elif self.coordinator.virtual_off:
-            target = replace_hsbk(
-                self.coordinator.display_color, parse_hsbk_changes(**kwargs)
-            )
-            if self.coordinator.actual_power_on:
-                await self.set_color(target, kwargs, duration=duration)
-            else:
-                await self.set_color(target, kwargs)
-                await self.set_power(True, duration=duration)
-            self.coordinator.async_record_virtual_on(target)
-        else:
-            if new_hsbk:
-                await self.set_color(
-                    new_hsbk,
-                    kwargs,
-                    duration=0.0 if fading_on else max(duration, LIFX_MIN_COLOR_RAMP),
+                    await self.set_color(
+                        new_hsbk, kwargs, duration=duration, token=token
+                    )
+                if store.async_is_current(token):
+                    await self.set_power(False, duration=duration)
+        except HomeAssistantError:
+            await store.async_finish(token, "uncertain")
+            raise
+        await store.async_finish(token, "completed")
+
+    async def _async_recover_virtual_off(
+        self, kwargs: dict[str, Any], duration: float, reserved: VirtualPowerToken
+    ) -> None:
+        """Restore required components, then power on an actually-off device."""
+        store = self.manager.virtual_power
+        serial = self.coordinator.virtual_power_serial
+        record = self.coordinator.virtual_power_record
+        target = resolve_recovery_image(
+            record,
+            self.coordinator.data,
+            parse_hsbk_changes(**kwargs),
+            zones=tuple(kwargs[ATTR_ZONES]) if ATTR_ZONES in kwargs else None,
+        )
+        tokens = await store.async_begin_many(
+            {
+                serial: VirtualPowerRequest(
+                    kind="on",
+                    before_image=capture_image(self.coordinator.data),
+                    target_image=target,
+                    before_power_on=self.coordinator.actual_power_on,
+                    before_virtual_off=record.virtual_off,
+                    before_resume_required=record.resume_required,
+                    duration=duration,
                 )
-            if power_on:
-                await self.set_power(True, duration=duration if fading_on else 0.0)
-            if power_off:
-                await self.set_power(False, duration=duration if self.is_on else 0.0)
+            },
+            expected={serial: reserved},
+        )
+        if (token := tokens.get(serial)) is None:
+            return
+        try:
+            if self.coordinator.actual_power_on:
+                await self.async_write_recovery_image(target, duration=duration)
+            else:
+                await self.async_write_recovery_image(target, duration=0.0)
+                if store.async_is_current(token):
+                    await self.set_power(True, duration=duration)
+        except HomeAssistantError:
+            await store.async_finish(token, "uncertain")
+            raise
+        await store.async_finish(token, "completed")
 
-        # Avoid state ping-pong by holding off updates as the state settles
-        await asyncio.sleep(LIFX_STATE_SETTLE_DELAY)
+    async def _async_prepare_next_on(
+        self, kwargs: dict[str, Any], reserved: VirtualPowerToken
+    ) -> None:
+        """Update the next-on image while a virtual-derived light stays dark."""
+        store = self.manager.virtual_power
+        serial = self.coordinator.virtual_power_serial
+        record = self.coordinator.virtual_power_record
+        target = resolve_recovery_image(
+            record,
+            self.coordinator.data,
+            parse_hsbk_changes(**kwargs),
+            zones=tuple(kwargs[ATTR_ZONES]) if ATTR_ZONES in kwargs else None,
+        )
+        tokens = await store.async_begin_many(
+            {
+                serial: VirtualPowerRequest(
+                    kind="prepare",
+                    before_image=capture_image(self.coordinator.data),
+                    target_image=target,
+                    before_power_on=self.coordinator.actual_power_on,
+                    before_virtual_off=record.virtual_off,
+                    before_resume_required=record.resume_required,
+                    duration=0.0,
+                )
+            },
+            expected={serial: reserved},
+        )
+        if (token := tokens.get(serial)) is not None:
+            await store.async_finish(token, "completed")
 
-        # Update when the transition starts and ends
-        await self.update_during_transition(duration)
+    async def async_write_recovery_image(
+        self, image: VirtualPowerImage, *, duration: float
+    ) -> None:
+        """Write every component of a recovery image explicitly."""
+        try:
+            await self.device.set_waveform_optional(
+                image.color,
+                period=duration,
+                cycles=1,
+                waveform=LightWaveform.HALF_SINE,
+                transient=False,
+                set_hue=True,
+                set_saturation=True,
+                set_brightness=True,
+                set_kelvin=True,
+            )
+        except LifxError as err:
+            raise device_error(err) from err
 
     async def _async_set_deprecated_infrared(self, kwargs: dict[str, Any]) -> None:
         """Handle the deprecated 'infrared' attribute of 'lifx.set_state'."""
@@ -393,9 +616,18 @@ class LIFXLight(LIFXEntity, LightEntity, RestoreEntity):
         hsbk: HSBK,
         kwargs: dict[str, Any],
         duration: float = 0.0,
+        *,
+        token: VirtualPowerToken | None = None,
     ) -> None:
         """Send a color change to the bulb."""
         changes = parse_hsbk_changes(**kwargs)
+        if token is not None:
+            before = VirtualPowerImage(self.coordinator.data.color)
+            target = merge_image(before, changes)
+            if not await self.manager.virtual_power.async_update_prepared(
+                token, before, target
+            ):
+                return
         try:
             await self.device.set_waveform_optional(
                 hsbk,
@@ -428,11 +660,6 @@ class LIFXLight(LIFXEntity, LightEntity, RestoreEntity):
             self.manager.async_register_entity(self.entity_id, self.coordinator)
         )
         await super().async_added_to_hass()
-        if (last_data := await self.async_get_last_extra_data()) is not None:
-            data = LIFXVirtualPowerStoredData.from_dict(last_data.as_dict())
-            self.coordinator.virtual_off = data.virtual_off
-            self.coordinator.resume_hsbk = data.resume_hsbk
-        self.coordinator.async_reconcile_virtual_power()
 
     @override
     @property
@@ -527,6 +754,8 @@ class LIFXMultiZone(LIFXColor):
         hsbk: HSBK,
         kwargs: dict[str, Any],
         duration: float = 0.0,
+        *,
+        token: VirtualPowerToken | None = None,
     ) -> None:
         """Set the requested zones, leaving every other zone as it is."""
         device = self.device
@@ -540,6 +769,8 @@ class LIFXMultiZone(LIFXColor):
             # Every zone is written back, so a zone changed outside Home
             # Assistant has to be read before it is merged over
             await self.async_refresh_before_merge()
+        if token is not None and not self.manager.virtual_power.async_is_current(token):
+            return
 
         state = cast(MultiZoneLightState, self.coordinator.data)
         if overwrites_every_zone:
@@ -560,10 +791,33 @@ class LIFXMultiZone(LIFXColor):
         if not zones:
             return
 
+        if token is not None and len(colors) == state.zone_count:
+            before = capture_image(state)
+            target = VirtualPowerImage(
+                before.color
+                if requested_zones is not None
+                else replace_hsbk(before.color, changes),
+                tuple(colors),
+            )
+            if not await self.manager.virtual_power.async_update_prepared(
+                token, before, target
+            ):
+                return
+
         try:
             await device.set_all_color_zones(
                 colors, start=zones[0], end=zones[-1], duration=duration
             )
+        except LifxError as err:
+            raise device_error(err) from err
+
+    @override
+    async def async_write_recovery_image(
+        self, image: VirtualPowerImage, *, duration: float
+    ) -> None:
+        """Write every saved zone, preserving the complete pattern."""
+        try:
+            await self.device.set_all_color_zones(list(image.zones), duration=duration)
         except LifxError as err:
             raise device_error(err) from err
 
@@ -587,23 +841,40 @@ class LIFXMatrix(LIFXColor):
         hsbk: HSBK,
         kwargs: dict[str, Any],
         duration: float = 0.0,
+        *,
+        token: VirtualPowerToken | None = None,
     ) -> None:
         """Set the tile colors, leaving each tile at its own brightness."""
         device = self.device
         if not cast(MatrixLightState, self.coordinator.data).tile_colors:
-            await super().set_color(hsbk, kwargs, duration)
+            await super().set_color(hsbk, kwargs, duration, token=token)
             return
         changes = parse_hsbk_changes(**kwargs)
         if not overwrites_existing_color(changes):
             # Every tile is written back, so a tile changed outside Home
             # Assistant has to be read before it is merged over
             await self.async_refresh_before_merge()
+        if token is not None and not self.manager.virtual_power.async_is_current(token):
+            return
         state = cast(MatrixLightState, self.coordinator.data)
         colors = [replace_hsbk(color, changes) for color in state.tile_colors]
+        if token is not None and len(state.tile_colors) == sum(
+            tile.total_zones for tile in state.chain
+        ):
+            before = capture_image(state)
+            if not await self.manager.virtual_power.async_update_prepared(
+                token, before, merge_image(before, changes)
+            ):
+                return
         # tile_colors spans the whole chain, but each tile is written on its own
         offset = 0
         try:
             for tile in state.chain:
+                if (
+                    token is not None
+                    and not self.manager.virtual_power.async_is_current(token)
+                ):
+                    return
                 tile_colors = colors[offset : offset + tile.total_zones]
                 offset += tile.total_zones
                 if len(tile_colors) != tile.total_zones:
@@ -620,6 +891,19 @@ class LIFXMatrix(LIFXColor):
                     tile.tile_index,
                     tile_colors,
                     duration=round(duration * 1000),
+                )
+        except LifxError as err:
+            raise device_error(err) from err
+
+    @override
+    async def async_write_recovery_image(
+        self, image: VirtualPowerImage, *, duration: float
+    ) -> None:
+        """Write every saved tile pixel without repainting unrelated tiles."""
+        try:
+            for tile in image.tiles:
+                await self.device.set_matrix_colors(
+                    tile.index, list(tile.colors), duration=round(duration * 1000)
                 )
         except LifxError as err:
             raise device_error(err) from err

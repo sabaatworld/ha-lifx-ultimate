@@ -64,6 +64,7 @@ from .util import (
     parse_hsbk_changes,
     replace_hsbk,
 )
+from .virtual_power import LIFXVirtualPowerStore
 
 EFFECT_FLAME_DEFAULT_SPEED = 3
 
@@ -98,6 +99,7 @@ class LIFXManager:
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize the manager."""
         self.hass = hass
+        self.virtual_power = LIFXVirtualPowerStore(hass)
         self.effects_conductor = Conductor()
         self.entity_id_to_coordinator: dict[str, Any] = {}
 

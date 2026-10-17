@@ -7,6 +7,11 @@
       "theme": {
         "default": "mdi:palette"
       }
+    },
+    "switch": {
+      "virtual_power_off": {
+        "default": "mdi:lightbulb-off-outline"
+      }
     }
   },
   "services": {

@@ -32,9 +32,23 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, INFRARED_LEVELS, LIFX_IDENTIFY_DELAY, LOGGER
+from .const import (
+    CONF_VIRTUAL_POWER_OFF,
+    DATA_LIFX_MANAGER,
+    DOMAIN,
+    INFRARED_LEVELS,
+    LIFX_IDENTIFY_DELAY,
+    LOGGER,
+)
 from .util import device_error
+from .virtual_power import (
+    VirtualPowerImage,
+    VirtualPowerRecord,
+    capture_image,
+    image_matches_layout,
+)
 
 type LIFXState = (
     LightState
@@ -56,12 +70,13 @@ class LIFXUpdateCoordinator(DataUpdateCoordinator[LIFXState]):
     ) -> None:
         """Initialize the coordinator."""
         self.device = device
+        self._entry = entry
         self.last_used_theme: str | None = None
         self.transition_on_duration: float = 0.0
         self.transition_off_duration: float = 0.0
         self.transition_cross_duration: float = 0.0
-        self.virtual_off = False
-        self.resume_hsbk: HSBK | None = None
+        self._virtual_power = hass.data[DATA_LIFX_MANAGER].virtual_power
+        self._serial = device.serial
         super().__init__(
             hass,
             LOGGER,
@@ -92,12 +107,54 @@ class LIFXUpdateCoordinator(DataUpdateCoordinator[LIFXState]):
             ) from err
         state = self.device.state
         assert state is not None
+        await self._virtual_power.async_reconcile(
+            self._serial, state, now=dt_util.utcnow()
+        )
         return cast(LIFXState, state)
+
+    @property
+    def virtual_power_off_enabled(self) -> bool:
+        """Return the physical target's independently persisted future-off policy."""
+        return bool(self._entry.options.get(CONF_VIRTUAL_POWER_OFF, True))
+
+    @property
+    def virtual_power_record(self) -> VirtualPowerRecord:
+        """Return the manager-owned authoritative serial record."""
+        return self._virtual_power.async_get_record(self._serial)
+
+    @property
+    def command_image(self) -> VirtualPowerImage:
+        """Prefer an acknowledged target until a fresh observation supersedes it."""
+        image = self.virtual_power_record.image
+        if image is not None and image_matches_layout(image, self.data):
+            return image
+        return capture_image(self.data)
+
+    @property
+    def virtual_off(self) -> bool:
+        """Return the confirmed virtual-off compatibility view."""
+        return self.virtual_power_record.virtual_off
+
+    @property
+    def resume_required(self) -> bool:
+        """Return whether virtual-derived recovery is still required."""
+        return self.virtual_power_record.resume_required
+
+    @property
+    def resume_hsbk(self) -> HSBK | None:
+        """Return the legacy overall recovery color view."""
+        image = self.virtual_power_record.image
+        return image.color if image is not None else None
 
     @property
     def serial_number(self) -> str:
         """Return the raw LIFX serial that identifies the device."""
         return self.data.serial
+
+    @property
+    def virtual_power_serial(self) -> str:
+        """Return the recovery-store key bound to this device."""
+        return self._serial
 
     @property
     def actual_power_on(self) -> bool:
@@ -112,19 +169,29 @@ class LIFXUpdateCoordinator(DataUpdateCoordinator[LIFXState]):
     @callback
     def async_record_virtual_off(self, color: HSBK) -> None:
         """Record a successful whole-light virtual power-off request."""
-        self.resume_hsbk = color
-        self.virtual_off = True
+        self._virtual_power.async_set_compatibility(
+            self._serial,
+            virtual_off=True,
+            image=self.virtual_power_record.image
+            if self.resume_required
+            else VirtualPowerImage(color),
+            resume_required=True,
+        )
 
     @callback
     def async_record_virtual_on(self, color: HSBK) -> None:
         """Record a successful visible whole-light command."""
-        self.resume_hsbk = color
-        self.virtual_off = False
+        self._virtual_power.async_set_compatibility(
+            self._serial,
+            virtual_off=False,
+            image=VirtualPowerImage(color),
+            resume_required=False,
+        )
 
     @callback
     def async_clear_virtual_off(self) -> None:
         """Clear a superseded Device Group virtual-off marker."""
-        self.virtual_off = False
+        self._virtual_power.async_set_compatibility(self._serial, virtual_off=False)
 
     @callback
     def async_reconcile_virtual_power(self) -> None:
@@ -132,7 +199,7 @@ class LIFXUpdateCoordinator(DataUpdateCoordinator[LIFXState]):
         if self.data.power == 0:
             if self.virtual_off:
                 LOGGER.debug("LIFX virtual off cleared after physical power-off poll")
-            self.virtual_off = False
+            self.async_clear_virtual_off()
             return
         state = self.data
         if isinstance(state, MultiZoneLightState):

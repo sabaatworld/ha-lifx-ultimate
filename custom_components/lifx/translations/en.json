@@ -91,6 +91,11 @@
             "rssi": {
                 "name": "RSSI"
             }
+        },
+        "switch": {
+            "virtual_power_off": {
+                "name": "Virtual Power Off"
+            }
         }
     },
     "exceptions": {
@@ -126,6 +131,9 @@
         },
         "not_loaded": {
             "message": "LIFX is not loaded, so this action cannot be performed."
+        },
+        "recovery_save_failed": {
+            "message": "The LIFX recovery state could not be saved, so the requested change was not sent"
         },
         "update_failed": {
             "message": "Error fetching the state of the LIFX device: {error}"

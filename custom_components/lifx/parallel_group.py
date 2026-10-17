@@ -40,6 +40,7 @@ from homeassistant.helpers.event import async_call_later
 from .const import (
     CONF_GROUP_ID,
     CONF_MEMBERS,
+    CONF_VIRTUAL_POWER_OFF,
     DATA_LIFX_MANAGER,
     DEVICE_GROUP_KEEPALIVE_INTERVAL,
     DEVICE_GROUP_KEEPALIVE_MAX_CONSECUTIVE_FAILURES,
@@ -86,12 +87,27 @@ from .parallel import (
     LIFXParallelRuntime,
     ParallelCommand,
     ParallelDispatchOutcome,
+    ParallelDispatchOwner,
     ParallelDispatchResult,
     ParallelTransport,
 )
-from .util import find_hsbk
+from .parallel_commands import align_visible_stages, compile_image_stages
+from .util import (
+    HSBKChanges,
+    find_hsbk,
+    parse_hsbk_changes,
+    resolve_color_ramp_duration,
+)
+from .virtual_power import (
+    LIFXVirtualPowerStore,
+    VirtualPowerRequest,
+    VirtualPowerToken,
+    darken_image,
+    merge_image,
+    resolve_recovery_image,
+)
 
-GROUP_PLATFORMS = [Platform.BUTTON, Platform.LIGHT, Platform.NUMBER]
+GROUP_PLATFORMS = [Platform.BUTTON, Platform.LIGHT, Platform.NUMBER, Platform.SWITCH]
 
 
 def _color_modes(coordinator: LIFXUpdateCoordinator) -> set[ColorMode]:
@@ -254,6 +270,16 @@ class LIFXParallelGroupRuntime:
         self._keepalive_generation = 0
         self._cancel_keepalive: CALLBACK_TYPE | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
+
+    @property
+    def virtual_power_off_enabled(self) -> bool:
+        """Return this target's policy independently of member policies."""
+        return bool(self.entry.options.get(CONF_VIRTUAL_POWER_OFF, True))
+
+    @property
+    def _virtual_power_store(self) -> LIFXVirtualPowerStore:
+        """Return the integration-owned recovery authority."""
+        return self.hass.data[DATA_LIFX_MANAGER].virtual_power
 
     @property
     def available(self) -> bool:
@@ -691,10 +717,12 @@ class LIFXParallelGroupRuntime:
         member: LIFXUpdateCoordinator,
         kind: Literal["on", "off", "cross"],
         kwargs: dict[str, Any],
+        *,
+        ordinary: bool = False,
     ) -> int:
         if ATTR_TRANSITION in kwargs:
-            return round(kwargs[ATTR_TRANSITION] * 1000)
-        if kind == "off":
+            duration = kwargs[ATTR_TRANSITION]
+        elif kind == "off":
             duration = self.transition_off_duration or member.transition_off_duration
         elif kind == "cross":
             duration = (
@@ -702,7 +730,12 @@ class LIFXParallelGroupRuntime:
             )
         else:
             duration = self.transition_on_duration or member.transition_on_duration
-        return round(duration * 1000)
+        return round(
+            resolve_color_ramp_duration(
+                duration, explicit=ATTR_TRANSITION in kwargs, ordinary=ordinary
+            )
+            * 1000
+        )
 
     def _begin_projection(self, states: tuple[_MemberCommandState, ...]) -> int:
         """Make a command target visible to the virtual light immediately."""
@@ -814,6 +847,18 @@ class LIFXParallelGroupRuntime:
             LOGGER.warning("LIFX Device Group recovered after a successful command")
             self.async_update_listeners()
 
+    def _reset_keepalive_health_for(self, success: frozenset[int]) -> None:
+        """Reset endpoint health only for members whose communication succeeded."""
+        changed = False
+        for index in success:
+            if self._keepalive_failures[index] or not self._keepalive_healthy[index]:
+                changed = True
+            self._keepalive_failures[index] = 0
+            self._keepalive_healthy[index] = True
+        if changed:
+            LOGGER.warning("LIFX Device Group recovered after a successful command")
+            self.async_update_listeners()
+
     def _display_state_for_command(self, operation: str) -> _OptimisticGroupState:
         """Snapshot and log the displayed state used to build one operation."""
         display_state = self.display_state
@@ -837,80 +882,293 @@ class LIFXParallelGroupRuntime:
             if power is True and not display_state.is_on
             else "cross"
         )
-        display_power_level = 65535 if display_state.is_on else 0
-        commands: list[ParallelCommand] = []
+        eligible = self._eligible_member_indexes()
+        stages: list[tuple[ParallelCommand, ...]] = []
         states: list[_MemberCommandState] = []
-
-        for member in self.members:
+        virtual_requests: dict[int, VirtualPowerRequest] = {}
+        changes = parse_hsbk_changes(**kwargs)
+        requested_zones = tuple(kwargs["zones"]) if "zones" in kwargs else None
+        member_states = self.member_states
+        for index, member in enumerate(self.members):
+            if index not in eligible:
+                stages.append(())
+                states.append(member_states[index])
+                continue
             color = _hsbk_to_raw16(hsbk) if hsbk else None
-            duration = self._transition_ms(member, transition_kind, kwargs)
+            record = member.virtual_power_record
+            member_derived = (
+                record.virtual_off
+                or record.resume_required
+                or record.pending is not None
+            )
+            duration = self._transition_ms(
+                member,
+                "on" if power is True and member_derived else transition_kind,
+                kwargs,
+                ordinary=not member_derived
+                and transition_kind == "cross"
+                and color is not None,
+            )
             target_color = color or display_state.color
             target_power = (
-                65535 if power is True else 0 if power is False else display_power_level
+                65535
+                if power is True
+                else 0
+                if power is False
+                else member_states[index].power_level
             )
-            states.append(_MemberCommandState(target_color, target_power))
+            before = member.command_image
+            recovery = None
             if power is False:
-                commands.append(
-                    ParallelCommand(
-                        "color",
-                        (*target_color[:2], 0, target_color[3], duration),
+                resume = (
+                    resolve_recovery_image(
+                        record, member.data, changes, zones=requested_zones
                     )
+                    if member_derived
+                    else merge_image(before, changes, zones=requested_zones)
                 )
-            elif power is True and not display_state.is_on:
-                if member.data.power != 0:
-                    commands.append(
-                        ParallelCommand(
-                            "color", (*target_color, duration), pad_before=1
-                        )
+                recovery = resume if hsbk is not None else None
+                target_color = _hsbk_to_raw16(resume.color)
+                if self.virtual_power_off_enabled:
+                    kind = "virtual_off"
+                    target = darken_image(resume)
+                    member_stages = compile_image_stages(
+                        target, member.data, duration_ms=duration, power_on=None
                     )
                 else:
-                    commands.append(
-                        ParallelCommand(
-                            "color",
-                            (*target_color, 0),
-                            ParallelCommand("power", (True, duration)),
-                        )
+                    kind = "actual_off"
+                    target = None
+                    member_stages = (ParallelCommand("power", (False, duration)),)
+            elif member_derived:
+                target = resolve_recovery_image(
+                    record, member.data, changes, zones=requested_zones
+                )
+                target_color = _hsbk_to_raw16(target.color)
+                if power is None and not member_states[index].power_level:
+                    kind = "prepare"
+                    member_stages = ()
+                else:
+                    kind = "on"
+                    member_stages = compile_image_stages(
+                        target, member.data, duration_ms=duration, power_on=power
                     )
-            elif color is not None:
-                commands.append(ParallelCommand("color", (*color, duration)))
-            elif power is not None:
-                commands.append(ParallelCommand("color", (*target_color, duration)))
             else:
-                raise ValueError("LIFX group action did not contain a state change")
+                if hsbk is None and power is None:
+                    raise ValueError("LIFX group action did not contain a state change")
+                kind = "on"
+                overall = _raw16_to_hsbk(target_color)
+                target = merge_image(
+                    before,
+                    HSBKChanges(
+                        hue=overall.hue,
+                        saturation=overall.saturation,
+                        brightness=overall.brightness,
+                        kelvin=overall.kelvin,
+                    ),
+                )
+                # Ordinary group writes retain the existing whole-light baseline.
+                if power is True and not display_state.is_on and member.data.power == 0:
+                    member_stages = (
+                        ParallelCommand("color", (*target_color, 0)),
+                        ParallelCommand("power", (True, duration)),
+                    )
+                else:
+                    member_stages = (
+                        ParallelCommand("color", (*target_color, duration)),
+                    )
+            virtual_requests[index] = VirtualPowerRequest(
+                kind=kind,
+                before_image=before,
+                target_image=target,
+                before_power_on=member.data.power != 0,
+                before_virtual_off=record.virtual_off,
+                before_resume_required=record.resume_required,
+                duration=duration / 1000,
+                recovery_image=recovery,
+            )
+            stages.append(member_stages)
+            states.append(_MemberCommandState(target_color, target_power))
 
         await self._async_dispatch_projected_states(
-            tuple(commands),
+            align_visible_stages(tuple(stages)),
             tuple(states),
-            virtual_off=power is False,
+            virtual_requests,
         )
 
     async def _async_dispatch_projected_states(
         self,
-        commands: tuple[ParallelCommand, ...],
+        commands: tuple[ParallelCommand | None, ...],
         states: tuple[_MemberCommandState, ...],
-        virtual_off: bool = False,
+        virtual_requests: dict[int, VirtualPowerRequest] | None = None,
     ) -> bool:
-        """Dispatch a command and keep its aggregate projection until polling catches up."""
-        generation = self._begin_projection(states)
+        """Own reservations through save, dispatch, cancellation, and cleanup."""
+        requests = virtual_requests or {}
+        store = self._virtual_power_store
+        eligible = self._eligible_member_indexes()
+        reserved = {
+            index: store.async_reserve(self.members[index].virtual_power_serial)
+            for index in requests
+            if index in eligible
+        }
+        attempted: set[int] = set()
+        dispatch_owner = ParallelDispatchOwner()
         try:
-            result = await self.parallel.async_dispatch(
-                self._commands_for_available_members(commands)
+            return await self._async_dispatch_prepared_states(
+                commands,
+                states,
+                requests,
+                reserved,
+                attempted,
+                dispatch_owner,
             )
-        except HomeAssistantError:
-            result = ParallelDispatchResult(ParallelDispatchOutcome.FAILED, 0)
+        except asyncio.CancelledError:
+            if attempted:
+                await asyncio.shield(
+                    self.parallel.async_cancel_members(
+                        frozenset(attempted), owner=dispatch_owner
+                    )
+                )
+            for index, token in reserved.items():
+                await asyncio.shield(
+                    store.async_finish(
+                        token, "uncertain" if index in attempted else "not_sent"
+                    )
+                )
+            raise
+        finally:
+            for token in reserved.values():
+                store.async_release(token)
+
+    async def _async_dispatch_prepared_states(
+        self,
+        commands: tuple[ParallelCommand | None, ...],
+        states: tuple[_MemberCommandState, ...],
+        virtual_requests: dict[int, VirtualPowerRequest],
+        reserved: dict[int, VirtualPowerToken],
+        attempted: set[int],
+        dispatch_owner: ParallelDispatchOwner,
+    ) -> bool:
+        """Dispatch a command and commit virtual state for successful members."""
+        virtual_requests = virtual_requests or {}
+        eligible = self._eligible_member_indexes()
+        bindings = tuple(self.members)
+        store = self._virtual_power_store
+        tokens: dict[int, VirtualPowerToken] = {}
+        if virtual_requests:
+            requests = {
+                bindings[index].virtual_power_serial: request
+                for index, request in virtual_requests.items()
+                if index in eligible
+            }
+            resolved = await store.async_begin_many(
+                requests, expected={token.serial: token for token in reserved.values()}
+            )
+            tokens = {
+                index: resolved[bindings[index].virtual_power_serial]
+                for index in virtual_requests
+                if index in eligible
+                and bindings[index].virtual_power_serial in resolved
+            }
+            if not tokens:
+                return False
+        accepted = frozenset(
+            index
+            for index in eligible
+            if self.members[index] is bindings[index]
+            and index in self._eligible_member_indexes()
+            and (
+                not virtual_requests
+                or (index in tokens and store.async_is_current(tokens[index]))
+            )
+        )
+        sent = frozenset(index for index in accepted if commands[index] is not None)
+        generation = self._begin_projection(states)
+        if sent:
+            attempted.update(sent)
+            try:
+                result = await self.parallel.async_dispatch(
+                    tuple(
+                        command if index in sent else None
+                        for index, command in enumerate(commands)
+                    ),
+                    owner=dispatch_owner,
+                )
+            except HomeAssistantError:
+                result = ParallelDispatchResult(ParallelDispatchOutcome.FAILED, 0)
+        else:
+            result = ParallelDispatchResult(ParallelDispatchOutcome.COMPLETED, 0)
+        accepted = frozenset(
+            index
+            for index in accepted
+            if self.members[index] is bindings[index]
+            and index in self._eligible_member_indexes()
+            and (
+                not virtual_requests
+                or (index in tokens and store.async_is_current(tokens[index]))
+            )
+        )
+        success = (
+            (sent - result.failed_member_indexes) & accepted
+            if result.outcome is ParallelDispatchOutcome.COMPLETED
+            else frozenset()
+        )
+        for index, token in tokens.items():
+            current = (
+                self.members[index] is bindings[index]
+                and index in self._eligible_member_indexes()
+                and store.async_is_current(token)
+            )
+            if index in success or (
+                index in accepted
+                and commands[index] is None
+                and virtual_requests[index].kind == "prepare"
+            ):
+                outcome = (
+                    "completed"
+                    if current
+                    else "uncertain"
+                    if index in sent
+                    else "not_sent"
+                )
+            elif index in sent:
+                outcome = "uncertain"
+            else:
+                outcome = "not_sent"
+            await store.async_finish(token, outcome)
         if result.outcome is not ParallelDispatchOutcome.COMPLETED:
             self._clear_projection(generation)
             self._log_dispatch_outcome("state", result)
             return False
-        self._reset_keepalive_health()
-        for member, state in zip(self.members, states, strict=True):
-            if virtual_off:
-                member.async_record_virtual_off(_raw16_to_hsbk(state.color))
-            elif state.power_level:
-                member.async_record_virtual_on(_raw16_to_hsbk(state.color))
-            # Virtual power changes must not replace the typed physical state.
-            member.async_update_listeners()
+        success = frozenset(
+            index
+            for index in success
+            if self.members[index] is bindings[index]
+            and index in self._eligible_member_indexes()
+            and (index not in tokens or store.async_is_current(tokens[index]))
+        )
+        self._reset_keepalive_health_for(success)
+        for index in accepted:
+            if (
+                self.members[index] is bindings[index]
+                and index in self._eligible_member_indexes()
+                and (index not in tokens or store.async_is_current(tokens[index]))
+            ):
+                bindings[index].async_update_listeners()
         return True
+
+    def _eligible_member_indexes(self) -> frozenset[int]:
+        """Capture the current physical binding and transport eligibility."""
+        return frozenset(
+            index
+            for index, (entry, member) in enumerate(
+                zip(self.member_entries, self.members, strict=True)
+            )
+            if entry.state is ConfigEntryState.LOADED
+            and getattr(entry, "runtime_data", None) is member
+            and member.last_update_success
+            and self._member_ready[index]
+            and self._keepalive_healthy[index]
+        )
 
     def _with_power_stage(
         self, commands: tuple[ParallelCommand, ...], kwargs: dict[str, Any]

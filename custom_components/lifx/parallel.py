@@ -84,6 +84,14 @@ class ParallelTransport:
 
 
 @dataclass(frozen=True, slots=True)
+class ParallelPacket:
+    """A library-serialized payload with a worker-assigned header and sequence."""
+
+    packet_type: int
+    payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class ParallelCommand:
     """One already-resolved instruction for a single worker."""
 
@@ -113,6 +121,13 @@ class _Worker:
 
 
 @dataclass(slots=True)
+class ParallelDispatchOwner:
+    """An admission fence retained even if cancellation precedes queue admission."""
+
+    cancelled: bool = False
+
+
+@dataclass(slots=True)
 class _DispatchRequest:
     """One supersedable request owned by the dispatcher thread."""
 
@@ -121,6 +136,14 @@ class _DispatchRequest:
     done: threading.Event
     health: bool = False
     result: ParallelDispatchResult | None = None
+    owner: ParallelDispatchOwner | None = None
+
+
+@dataclass(slots=True)
+class _DispatchBarrier:
+    indexes: frozenset[int]
+    done: threading.Event = field(default_factory=threading.Event)
+    error: HomeAssistantError | None = None
 
 
 def _header(
@@ -619,6 +642,36 @@ def _report_dispatch_result(
         pipe.send(("ACK_TIMEOUT", request_id, stage, attempt))
 
 
+def _build_packet_batch(
+    payloads: tuple[ParallelPacket, ...],
+    source: int,
+    target: bytes,
+    next_sequence: Callable[[], int],
+    *,
+    ack_required: bool,
+) -> tuple[tuple[bytes, int], ...]:
+    if not payloads or len(payloads) > 64:
+        raise ValueError("A packet batch requires 1 through 64 payloads")
+    result = []
+    for payload in payloads:
+        sequence = next_sequence()
+        result.append(
+            (
+                _header(
+                    payload.packet_type,
+                    source,
+                    sequence,
+                    target,
+                    len(payload.payload),
+                    ack_required=ack_required,
+                )
+                + payload.payload,
+                sequence,
+            )
+        )
+    return tuple(result)
+
+
 def _dispatch_prepared(
     udp: socket.socket,
     source: int,
@@ -638,9 +691,19 @@ def _dispatch_prepared(
 ) -> bool:
     """Send one staged packet after its request-scoped dispatch message."""
     try:
-        packet, sequence = _build_packet(
-            command, source, target, next_sequence, ack_required=ack_required
-        )
+        if command.kind == "packet_batch":
+            batch = _build_packet_batch(
+                command.payload[0],
+                source,
+                target,
+                next_sequence,
+                ack_required=ack_required,
+            )
+            packet, sequence = batch[0]
+        else:
+            packet, sequence = _build_packet(
+                command, source, target, next_sequence, ack_required=ack_required
+            )
     except (TypeError, ValueError) as err:
         pipe.send(("ERROR", request_id, stage, attempt, str(err)))
         return True
@@ -676,26 +739,103 @@ def _dispatch_prepared(
         ) and time.monotonic() >= stage_deadline:
             pipe.send(("ACK_TIMEOUT", request_id, stage, attempt))
             return True
-        _report_dispatch_result(
-            udp,
-            pipe,
-            packet,
-            command,
-            source,
-            target,
-            sequence,
-            request_id,
-            stage,
-            attempt,
-            ack_required,
-            stage_deadline,
-            current_generation,
-            deferred_controls,
-        )
+        if command.kind == "packet_batch":
+            _report_batch_result(
+                udp,
+                pipe,
+                tuple(batch),
+                source,
+                target,
+                request_id,
+                stage,
+                attempt,
+                ack_required,
+                stage_deadline,
+                current_generation,
+                deferred_controls,
+            )
+        else:
+            _report_dispatch_result(
+                udp,
+                pipe,
+                packet,
+                command,
+                source,
+                target,
+                sequence,
+                request_id,
+                stage,
+                attempt,
+                ack_required,
+                stage_deadline,
+                current_generation,
+                deferred_controls,
+            )
     finally:
         if gc_was_enabled and not gc.isenabled():
             gc.enable()
     return True
+
+
+def _report_batch_result(
+    udp: socket.socket,
+    pipe: Connection,
+    batch: tuple[tuple[bytes, int], ...],
+    source: int,
+    target: bytes,
+    request_id: int,
+    stage: int,
+    attempt: int,
+    ack_required: bool,
+    stage_deadline: float,
+    current_generation: Any,
+    deferred_controls: deque[tuple[Any, ...]] | None,
+) -> None:
+    """Release a burst and retain every matching ACK, regardless of order."""
+    try:
+        for packet, _sequence in batch:
+            if current_generation.value != request_id:
+                pipe.send(("CANCELLED", request_id, stage, attempt))
+                return
+            _send_packet(udp, packet, "short UDP batch send")
+    except (OSError, ValueError) as err:
+        pipe.send(("ERROR", request_id, stage, attempt, str(err)))
+        return
+    if not ack_required:
+        pipe.send(("SENT", request_id, stage, attempt))
+        return
+    pending = {sequence for _packet, sequence in batch}
+    deadline = min(time.monotonic() + 3.0, stage_deadline)
+    while pending and (remaining := deadline - time.monotonic()) > 0:
+        if current_generation.value != request_id:
+            pipe.send(("CANCELLED", request_id, stage, attempt))
+            return
+        if pipe.poll(0):
+            control = pipe.recv()
+            if control[:3] == ("CANCEL", request_id, stage):
+                pipe.send(("CANCELLED", request_id, stage, attempt))
+                return
+            if deferred_controls is not None:
+                deferred_controls.append(control)
+        try:
+            udp.settimeout(min(0.01, remaining))
+            data = udp.recv(2048)
+        except TimeoutError:
+            continue
+        except OSError:
+            break
+        try:
+            reply_source, sequence, reply_target, packet_type = _parse_header(data)
+        except struct.error, ValueError:
+            continue
+        if (
+            reply_source == source
+            and reply_target == target
+            and packet_type == ACKNOWLEDGEMENT
+            and len(data) == HEADER_SIZE
+        ):
+            pending.discard(sequence)
+    pipe.send(("ACK_TIMEOUT" if pending else "ACKED", request_id, stage, attempt))
 
 
 def _worker(
@@ -739,6 +879,9 @@ def _worker(
             if command[0] == "CANCEL":
                 _kind, request_id, stage = command
                 pipe.send(("CANCELLED", request_id, stage))
+                continue
+            if command[0] == "BARRIER":
+                pipe.send(("BARRIERED", command[1]))
                 continue
             if command[0] == "RECONNECT":
                 _kind, reconnect_transport, reconnect_request_id = command
@@ -809,6 +952,7 @@ class LIFXParallelRuntime:
         self._pending_dispatch: _DispatchRequest | None = None
         self._active_dispatch: _DispatchRequest | None = None
         self._active_stage: tuple[int, int, tuple[_Worker, ...]] | None = None
+        self._barriers: deque[_DispatchBarrier] = deque()
         self._worker_events: dict[Connection, deque[tuple[Any, ...]]] = {}
         self._dispatcher_stopping = False
         self._dispatcher: threading.Thread | None = None
@@ -857,6 +1001,10 @@ class LIFXParallelRuntime:
     def _stop(self) -> None:
         with self._dispatch_condition:
             self._dispatcher_stopping = True
+            while self._barriers:
+                barrier = self._barriers.popleft()
+                barrier.error = HomeAssistantError("The LIFX dispatcher stopped")
+                barrier.done.set()
             if self._pending_dispatch is not None:
                 self._pending_dispatch.result = ParallelDispatchResult(
                     ParallelDispatchOutcome.UNAVAILABLE,
@@ -945,9 +1093,13 @@ class LIFXParallelRuntime:
     async def async_dispatch(
         self,
         commands: tuple[ParallelCommand | None, ...],
+        *,
+        owner: ParallelDispatchOwner | None = None,
     ) -> ParallelDispatchResult:
         """Dispatch the latest request, preempting any older staged request."""
-        return await self.hass.async_add_executor_job(self._queue_dispatch, commands)
+        return await self.hass.async_add_executor_job(
+            self._queue_dispatch, commands, False, owner
+        )
 
     async def async_keepalive(
         self, member_indexes: frozenset[int]
@@ -966,6 +1118,91 @@ class LIFXParallelRuntime:
     async def async_cancel_health(self) -> None:
         """Discard an active idle health request without waiting for cleanup."""
         await self.hass.async_add_executor_job(self._cancel_health)
+
+    async def async_cancel_members(
+        self,
+        indexes: frozenset[int],
+        *,
+        owner: ParallelDispatchOwner | None = None,
+    ) -> None:
+        """Cancel captured old mutations and await actual worker quiescence."""
+        if owner is not None:
+            owner.cancelled = True
+        if not indexes or self._dispatcher is None:
+            return
+        barrier = _DispatchBarrier(indexes)
+        with self._dispatch_condition:
+            if self._dispatcher_stopping:
+                return
+            matched = False
+            for request in (self._pending_dispatch, self._active_dispatch):
+                if (
+                    request is None
+                    or request.health
+                    or (owner is not None and request.owner is not owner)
+                    or not any(
+                        index < len(request.commands)
+                        and request.commands[index] is not None
+                        for index in indexes
+                    )
+                ):
+                    continue
+                matched = True
+                request.result = ParallelDispatchResult(
+                    ParallelDispatchOutcome.SUPERSEDED, request.request_id
+                )
+                request.done.set()
+                if request is self._pending_dispatch:
+                    self._pending_dispatch = None
+                if self._current_generation.value == request.request_id:
+                    self._request_id += 1
+                    self._current_generation.value = self._request_id
+                if (
+                    self._active_stage is not None
+                    and self._active_stage[0] == request.request_id
+                ):
+                    active_id, stage, workers = self._active_stage
+                    for worker in workers:
+                        with suppress(BrokenPipeError, EOFError, OSError):
+                            worker.pipe.send(("CANCEL", active_id, stage))
+            if owner is not None and not matched:
+                return
+            self._barriers.append(barrier)
+            self._dispatch_condition.notify_all()
+        await self.hass.async_add_executor_job(barrier.done.wait)
+        if barrier.error is not None:
+            raise barrier.error
+
+    def _finish_barrier(self, barrier: _DispatchBarrier) -> None:
+        try:
+            with self._lock:
+                workers = {
+                    self._workers[index].pipe: self._workers[index]
+                    for index in barrier.indexes
+                    if index < len(self._workers)
+                    and self._workers[index].process.is_alive()
+                }
+                nonce = secrets.randbits(64)
+                for worker in workers.values():
+                    worker.pipe.send(("BARRIER", nonce))
+                self._wait_for_barrier(workers, nonce)
+        except (HomeAssistantError, OSError, EOFError) as err:
+            barrier.error = HomeAssistantError(f"Unable to quiesce LIFX worker: {err}")
+        finally:
+            barrier.done.set()
+
+    def _wait_for_barrier(self, workers: dict[Connection, _Worker], nonce: int) -> None:
+        deadline = time.monotonic() + 1.0
+        while workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HomeAssistantError("Timed out waiting for worker quiescence")
+            for pipe in wait(tuple(workers), timeout=min(0.01, remaining)):
+                message = pipe.recv()
+                if message == ("BARRIERED", nonce):
+                    workers.pop(pipe)
+                else:
+                    self._store_worker_event(pipe, message)
 
     def _cancel_health(self) -> None:
         with self._dispatch_condition:
@@ -992,17 +1229,26 @@ class LIFXParallelRuntime:
                         worker.pipe.send(("CANCEL", request_id, stage))
 
     def _queue_dispatch(
-        self, commands: tuple[ParallelCommand | None, ...], health: bool = False
+        self,
+        commands: tuple[ParallelCommand | None, ...],
+        health: bool = False,
+        owner: ParallelDispatchOwner | None = None,
     ) -> ParallelDispatchResult:
         """Immediately supersede an active wait and replace unsent work."""
         if len(commands) != len(self._workers):
             return ParallelDispatchResult(ParallelDispatchOutcome.UNAVAILABLE, 0)
         with self._dispatch_condition:
+            if owner is not None and owner.cancelled:
+                return ParallelDispatchResult(ParallelDispatchOutcome.SUPERSEDED, 0)
             if self._dispatcher_stopping:
                 return ParallelDispatchResult(ParallelDispatchOutcome.UNAVAILABLE, 0)
             self._request_id += 1
             request = _DispatchRequest(
-                self._request_id, commands, threading.Event(), health
+                self._request_id,
+                commands,
+                threading.Event(),
+                health,
+                owner=owner,
             )
             if self._pending_dispatch is not None:
                 self._pending_dispatch.result = ParallelDispatchResult(
@@ -1033,13 +1279,23 @@ class LIFXParallelRuntime:
         """Serialize pipe ownership while allowing active work to be superseded."""
         while True:
             with self._dispatch_condition:
-                while self._pending_dispatch is None and not self._dispatcher_stopping:
+                while (
+                    self._pending_dispatch is None
+                    and not self._barriers
+                    and not self._dispatcher_stopping
+                ):
                     self._dispatch_condition.wait()
                 if self._dispatcher_stopping:
                     return
-                request = self._pending_dispatch
-                self._pending_dispatch = None
-                self._active_dispatch = request
+                barrier = self._barriers.popleft() if self._barriers else None
+                request = None
+                if barrier is None:
+                    request = self._pending_dispatch
+                    self._pending_dispatch = None
+                    self._active_dispatch = request
+            if barrier is not None:
+                self._finish_barrier(barrier)
+                continue
             assert request is not None
             try:
                 failed_member_indexes = self._dispatch(
