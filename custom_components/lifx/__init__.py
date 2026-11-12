@@ -145,9 +145,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: LIFXConfigEntry) -> bool
     entity_id = er.async_get(hass).async_get_entity_id(
         Platform.LIGHT, DOMAIN, entry.data[CONF_SERIAL]
     )
+    restore_data = restore_state.async_get(hass)
+    if (
+        get_stored_state := getattr(restore_data, "async_get_stored_state", None)
+    ) is None:
+        # Support Core versions before the 2026.11 restore-state API change.
+        get_stored_state = restore_data.last_states.get
     if (
         entity_id
-        and (stored := restore_state.async_get(hass).last_states.get(entity_id))
+        and (stored := get_stored_state(entity_id))
         and stored.extra_data is not None
     ):
         await hass.data[DATA_LIFX_MANAGER].virtual_power.async_import_legacy(
